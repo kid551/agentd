@@ -4,6 +4,7 @@
 //   node scripts/check-sensitive.mjs            every tracked file
 //   node scripts/check-sensitive.mjs --staged   what is about to be committed, and who commits it
 //   node scripts/check-sensitive.mjs --message <file>   a commit message (the commit-msg hook)
+//   node scripts/check-sensitive.mjs --commits <A..B>   commits already made: identities, messages
 //
 // The rules here are generic on purpose: a list of the owner's own words would itself leak
 // them. Personal words (company, hosts, private project names) go one per line in
@@ -141,6 +142,24 @@ export function messageText(raw) {
     .join('\n')
 }
 
+/**
+ * What a commit already on a branch gives away: its author and committer addresses, and
+ * its message. GitHub writes a squash merge as the account's own name and email, so the
+ * pre-commit hook never sees it; this is how CI catches it.
+ */
+export function commitProblems({ sha, author, committer, message }, words = []) {
+  const where = `(commit ${sha.slice(0, 7)})`
+  const out = []
+  for (const [role, email] of [
+    ['author', author],
+    ['committer', committer],
+  ])
+    if (!isPublicEmail(email || 'unset@unset'))
+      out.push({ path: where, line: 0, why: `${role} ${email}` })
+  for (const p of textProblems(where, message, words)) out.push(p)
+  return out
+}
+
 function main() {
   const argv = process.argv.slice(2)
   const staged = argv.includes('--staged')
@@ -155,6 +174,20 @@ function main() {
   const words = [
     ...new Set([...readWords('.sensitive-words'), ...readWords(join(common, '.sensitive-words'))]),
   ]
+
+  const commitsAt = argv.indexOf('--commits')
+  if (commitsAt !== -1) {
+    const range = argv[commitsAt + 1]
+    if (!range) throw new Error('--commits needs a revision range, e.g. A..B')
+    const problems = []
+    // %x1f between fields, %x1e between commits: neither turns up in a message.
+    for (const rec of git('log', '--format=%H%x1f%ae%x1f%ce%x1f%B%x1e', range).split('\x1e')) {
+      const [sha, author, committer, message] = rec.replace(/^\n/, '').split('\x1f')
+      if (sha) problems.push(...commitProblems({ sha, author, committer, message }, words))
+    }
+    report(problems, words)
+    return
+  }
 
   if (messageFile) {
     const problems = textProblems(
