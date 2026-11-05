@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Super-agent 并行派工：只读奏折 + MR 奏折（定稿）</title>
+<style>
+  body { font: 15px/1.7 -apple-system, "PingFang SC", sans-serif; max-width: 980px; margin: 32px auto; padding: 0 20px; color: #1f2328; }
+  h1 { font-size: 24px; } h2 { margin-top: 40px; border-bottom: 1px solid #d0d7de; padding-bottom: 4px; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 14px; }
+  th, td { border: 1px solid #d0d7de; padding: 6px 10px; text-align: left; vertical-align: top; }
+  th { background: #f6f8fa; }
+  code { background: #f6f8fa; padding: 1px 5px; border-radius: 4px; font-size: 13px; }
+  pre { background: #f6f8fa; padding: 12px; border-radius: 6px; overflow-x: auto; font-size: 13px; }
+  .decide { background: #fff8c5; border-left: 4px solid #d4a72c; padding: 8px 14px; margin: 12px 0; }
+  .bad { background: #ffebe9; border-left: 4px solid #cf222e; padding: 8px 14px; margin: 12px 0; }
+  .muted { color: #656d76; }
+</style>
+</head>
+<body>
+<h1>Super-agent 并行派工（定稿，已实现）</h1>
+<p class="muted">2026-11-04 · 初稿经 agentd-6c 审核，13 条意见全部采纳后重写 · agentd 守护进程、router-mod、dsh-superagent 三处都已实现 · 实现细节与偏差见 implementation-notes.md「并行派工」一节</p>
+
+<h2>0. 前提（用户已定）</h2>
+<ol>
+  <li>加只读奏折：不占项目，也不被占用拦住。</li>
+  <li>写入奏折每张开一个 worktree，从最新 <code>origin/main</code> 拉分支，通过 MR 回到 main，互不等待。</li>
+  <li>Worker 做完先交回；你点「开 MR」它才 commit / push。</li>
+  <li>验收完成后清理这张奏折的 worktree 和本地分支。</li>
+</ol>
+
+<h2>1. 和初稿不同、你最可能要调整的决策</h2>
+
+<div class="bad"><b>只读奏折没用 plan 模式（实测推翻了初稿 D4）。</b>后台会话里，plan 模式碰到 Write 不是拒绝，而是弹权限确认。agentd 自己的 report 工具也弹，加了放行钩子还是弹。没人能点，Worker 就卡住。改成 auto 模式并拿掉 Edit / Write / NotebookEdit，Bash 只靠规则约束。按你的决定，只读奏折仍然不占项目。残余风险：只读 Worker 违规用 Bash 写，正好撞上同目录的写入 Worker。</div>
+
+<div class="decide"><b>D1 交付方式按项目路径配置，默认 local。</b><code>~/.agentd/config.json</code> 加
+<pre>"projects": { "~/code/Acme/acme": { "delivery": "mr" } }</pre>
+用路径作 key：出现同名仓库时项目 id 会变，用 id 配置会悄悄失效。Router 的 <code>worktree</code> 参数去掉了：mr 项目的写入奏折一定开 worktree，local 项目一定在主目录。<b>这行配置还没写进你的 config.json，要你点头。</b></div>
+
+<div class="decide"><b>D2 合入即结束，自动停 Worker、自动清理。</b>合入不听 Worker 自报，守护进程自己用 <code>git ls-remote</code> 核对：origin 上这个分支已被删掉才算合入。acme 是压缩合并，看 main 的历史判断不了；自动合并脚本合入时会删源分支。</div>
+
+<div class="decide"><b>D3 合入前「收」= 放弃，不限状态。</b>有 worktree 的奏折，不管在哪个状态，收都要带 <code>discard=true</code>，面板是「放弃」按钮、点第二下确认。删 worktree 和分支，删前把提交存进 <code>refs/trash/&lt;分支&gt;</code>。dropped 也直接删。停（stop）不清理，因为之后还能恢复。</div>
+
+<div class="decide"><b>D5 位置与命名。</b><code>&lt;项目&gt;/.claude/worktrees/agentd-&lt;id&gt;-&lt;戳&gt;</code>，分支 <code>agentd/&lt;id&gt;-&lt;戳&gt;</code>，戳是奏折创建时间（36 进制）。dsh 用 <code>superagent</code> 前缀。两个宿主各自从 1 编号、库重置后编号重来，都不会撞名。不忽略 <code>.claude/</code> 的项目，会在仓库本地的 <code>.git/info/exclude</code> 加一行，不进版本库。</div>
+
+<h2>2. 数据模型</h2>
+<table>
+<tr><th>位置</th><th>变更</th></tr>
+<tr><td>agentd <code>tickets</code> 表（迁移 v4）</td><td><code>readonly</code>、<code>branch</code>、<code>worktree_path</code>、<code>repo_path</code>、<code>mr_opened_at</code>。原有的 <code>worktree</code> 列含义改为「MR 奏折」。清理后 <code>worktree_path</code> / <code>branch</code> 置空。</td></tr>
+<tr><td>dsh Ticket</td><td><code>readonly?</code>、<code>branch?</code>、<code>worktreePath?</code>、<code>mrOpened?</code></td></tr>
+<tr><td>事件</td><td><code>mr_requested</code>、<code>merged</code>（通知 Router）、<code>cleaned</code>、<code>kept</code>（通知 Router：没能自动清理）</td></tr>
+</table>
+
+<h2>3. 状态机：不加新状态（审核第 3 条）</h2>
+<pre>
+working ──done(ready)──▶ ready「待审」──open_mr──▶ working「MR 中」(mrOpened) ──done(merged)──▶ done → 停 Worker、清理
+   report / ask / answer / stalled / retry / resume 在 MR 阶段照常，mrOpened 不变
+任何有 worktree 的状态 ──close(discard)──▶ done → 停 Worker、强制清理
+</pre>
+
+<h2>4. 接口</h2>
+<table>
+<tr><th>接口</th><th>变更</th></tr>
+<tr><td>Router <code>dispatch</code> / <code>superagent_dispatch</code></td><td><code>readonly?</code>；去掉 <code>worktree</code></td></tr>
+<tr><td>Router <code>open_mr</code> / <code>superagent_open_mr</code>（新）</td><td>先把「【奏折 #N 开 MR】…」送进 Worker 会话，送到了才记录</td></tr>
+<tr><td>Router <code>close</code></td><td><code>discard?</code></td></tr>
+<tr><td>Worker <code>done</code></td><td>outcome 多一个 <code>merged</code>：只在开过 MR 后可用，并且要核对 origin</td></tr>
+<tr><td>HTTP</td><td><code>POST /tickets/:id/open_mr</code>；<code>close</code> 带 <code>{ discard }</code></td></tr>
+</table>
+
+<h2>5. 你会看到的</h2>
+<ul>
+  <li>acme 的几张写入奏折同时起，最多 4 张（<code>maxConcurrent</code>）。</li>
+  <li>卡片上多了「只读」或「⎇ 分支名」标签；「待审」卡片的按钮是「开 MR」和「放弃」。</li>
+  <li>「MR 中」卡片显示 Worker 最近的动作；合入后奏折自动进入已结束，事件里写着清理了什么。</li>
+</ul>
+
+<h2>6. Worker 规则 3（三种，<code>lane-rules.ts</code>）</h2>
+<ul>
+  <li><b>只读</b>：不改任何文件、不做有副作用的操作；没有写文件的工具，Bash 只跑只读命令。</li>
+  <li><b>MR</b>：分支名；不碰项目主目录（包括项目文档要求在主工作树做的对齐和 reset）；依赖自己准备。a 段做完不 commit、done(ready)；收到「开 MR」进入 b 段：commit、push、开 MR 并设删除源分支，自动合并脚本放后台跑、前台定期查看（单次等待不超过 5 分钟），只动自己的 MR，不直接推 main、不晋级，合入后 done(merged)。</li>
+  <li><b>local</b>：不变。</li>
+</ul>
+
+<h2>7. 实测结论</h2>
+<table>
+<tr><th>#</th><th>结论</th></tr>
+<tr><td>S1</td><td>plan 模式不可用（见第 1 节）。auto 模式加拿掉写工具，用真守护进程跑完一张只读奏折：读文件、跑 git log、report、done，全程不用人。</td></tr>
+<tr><td>S2</td><td><b>未实测</b>：Worker 在 worktree 里能否用项目自带的 MR 命令行工具查 MR。工具若按绝对路径读主目录的配置，从 worktree 调用应当一样。第一张真 MR 奏折时留意。</td></tr>
+<tr><td>S3</td><td>守护进程自己 fetch 并建 worktree，基于 origin/main，不基于本地 HEAD（有测试）。带子模块的 worktree 删除要加 <code>--force</code>（git 2.55 实测）。</td></tr>
+<tr><td>信任</td><td>已信任仓库的 worktree 能直接起（acme 实测）；从未被信任的仓库报未信任，父目录被信任也不算。</td></tr>
+<tr><td>端到端</td><td>一次性仓库：两张 MR 奏折同时建好 worktree；不带 discard 的收被拒；带 discard 的收删掉 worktree 和分支，提交留在 <code>refs/trash/</code>。</td></tr>
+</table>
+
+<h2>8. 遗留与风险</h2>
+<ul>
+  <li><b>冲突推迟到合入时</b>：后合入的那张要 rebase，语义冲突时 Worker 用 ask 问你。</li>
+  <li><b>有的项目 main 每进一个提交都会取消正在跑的流水线</b>：Router 提示词要求它建议你把纯文档的小改动并进已有的 MR 奏折，不单独开 MR。</li>
+  <li><b>规则 3 和项目文档冲突</b>：AGENTS.md 让 Agent 帮别人的 MR rebase、合并后在主工作树 reset，规则 3 都禁止。第一次并行时留意 Worker 听的是哪边。</li>
+  <li><b>dsh 的只读奏折只有规则约束</b>，照旧占用 local 项目（偏差 P2）。</li>
+  <li><b>旧方案留下的 worktree</b> 不归新清理逻辑管，要手动处理。<code>refs/trash/</code> 不会自动清。</li>
+</ul>
+</body>
+</html>

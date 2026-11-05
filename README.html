@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>agentd · 本地 Super-agent</title>
+<style>
+  :root { --fg:#1f2328; --muted:#656d76; --line:#d0d7de; --soft:#f6f8fa; --accent:#0969da; --warnbg:#fff8c5; --warn:#9a6700; }
+  body { font: 15px/1.7 -apple-system, "PingFang SC", "Helvetica Neue", sans-serif; color:var(--fg); max-width: 960px; margin: 40px auto; padding: 0 24px; }
+  h1 { font-size: 26px; border-bottom: 1px solid var(--line); padding-bottom: 10px; }
+  h2 { font-size: 20px; margin-top: 44px; border-bottom: 1px solid var(--line); padding-bottom: 6px; }
+  h3 { font-size: 16px; margin-top: 26px; }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
+  code { background: var(--soft); padding: 1px 5px; border-radius: 4px; }
+  pre { background: var(--soft); padding: 12px 14px; border-radius: 6px; overflow-x: auto; line-height: 1.5; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; }
+  th, td { border: 1px solid var(--line); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--soft); }
+  .muted { color: var(--muted); }
+  .note { border-left: 4px solid var(--warn); background: var(--warnbg); padding: 10px 14px; margin: 14px 0; }
+  .toc { background: var(--soft); padding: 12px 20px; border-radius: 6px; }
+</style>
+</head>
+<body>
+
+<h1>agentd <span class="muted" style="font-size:15px">本地 Super-agent：一个入口，批阅多个 Claude Code Worker</span></h1>
+
+<p>你只跟一个 Claude Code 会话说话，它叫 <b>Router</b>。Router 把活派给若干 <b>Worker</b>：每个 Worker 是在某个项目目录里运行的独立后台 Claude Code 会话，在 VSCode 的会话列表里原生可见。Worker 的提问、交付、受阻都汇总回 Router；输入框上方常显一行，告诉你此刻在批哪一张奏折。</p>
+<p>思路来自 DeepSeek《Super-agent 设计探索》的双层架构。方案与决策见 <a href="PLAN.html">PLAN.html</a>，实施中的验证与偏差见 <code>implementation-notes.md</code>。</p>
+
+<div class="toc">
+<b>目录</b>
+<ol>
+  <li><a href="#use">安装与使用</a></li>
+  <li><a href="#arch">架构</a></li>
+  <li><a href="#mech">机制原理</a></li>
+  <li><a href="#subtle">微妙之处</a></li>
+  <li><a href="#dev">开发与测试</a></li>
+  <li><a href="#ref">参考：接口、配置、文件</a></li>
+  <li><a href="#dsh">DeepSeek Harness 版（dsh-superagent）</a></li>
+</ol>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="use">1. 安装与使用</h2>
+
+<h3>1.1 一次性安装</h3>
+<pre><code>pnpm install
+pnpm build            # 构建守护进程、Worker 侧 MCP server 与审批钩子，并复制进 router-mod/daemon/
+pnpm setup:router     # 注册本仓库为本地插件 marketplace，并只在 router/ 目录启用插件
+code router           # 用 VSCode 打开 Router 工作区，在里面打开 Claude Code</code></pre>
+<p><code>setup:router</code> 做三件事：写 <code>router/.claude/settings.json</code>（Router 用 sonnet，启用插件）；执行 <code>claude plugin marketplace add &lt;本仓库&gt;</code>（用户级登记）；在 <code>router/</code> 下执行 <code>claude plugin install agentd-router@TerenceXie-agentd --scope project</code>。撤销用 <code>claude plugin marketplace remove TerenceXie-agentd</code>。</p>
+<p>市场原名 <code>agentd</code>。脚本可以重复跑：开头先 <code>marketplace remove agentd</code>（没登记过就跳过），并从 settings 里删掉 <code>agentd-router@agentd</code>，否则同一个插件会以两个 ID 各加载一次，每个钩子触发两次。跑完把开着的 Router 窗口重开或 <code>/reload-plugins</code>；守护进程和 Worker 不受影响。</p>
+<p>要派工的项目放在 <code>~/.agentd/config.json</code> 的 <code>roots</code> 下（默认 <code>~/code</code>）。守护进程不用手动启动：打开 Router 会话时插件会自动拉起它。</p>
+
+<h3>1.2 日常</h3>
+<ol>
+  <li>在 Router 里说人话派工：「在 acme-flutter 里把列表滚动掉帧修了，先别动数据层」。Router 回「#12 · acme-flutter · 修复列表滚动掉帧 · 已派出」。</li>
+  <li>继续派别的，Router 安静等待。</li>
+  <li>Worker 提问时，Router 会自己开口转述。如果你当时没在跟哪个奏折单聊，就自动进入和这个提问奏折的<b>单聊</b>，输入框上方显示：<br>
+      <code>▶ 单聊 #12 · acme-flutter · 修复列表滚动掉帧 · 它在等你回答<br>▶ Router 待处理 2 · 进行中 3 · 你的话直接发给它</code><br>
+      这时你直接打字，就是在回答 #12，话不经过 Router 模型。答完自动转到下一个在等回答的奏折（等得最久的先来）；没有了才回到对 Router 说。<br>
+      <b>一次只答一个。</b>你在回答 #12 时，别的奏折的事件（提问、交付、受阻、失败等）全部先排队：Router 不会转述它们，底栏照样写着 Router 的「待处理 N · 进行中 M」（N 包括你正在答的这一个）。答完 #12，单聊转到下一个提问，Router 这时才转述它；提问都答完、单聊结束后，排着的交付等事件再交给 Router。这样屏幕上最新要你回话的永远是你正在单聊的那一个，不会把给 #13 的回答或一句「收了」误发给 #12。<br>
+      <b>每个奏折一个框。</b>Router 回复里每段以「#号 · 项目 · 标题」开头的话（提问、权限请求、交付、受阻、派工确认都一样）各画在一个圆角框里，边框按该奏折<i>当前</i>的状态着色，和面板卡片的边框同一套颜色：黄＝在问你，绿＝待验收，红＝受阻/失败，蓝＝在干，灰＝排队或已不在列表里。颜色本身就告诉你这段要不要回话；旧消息的框会跟着奏折状态变色，比如答完后由黄变蓝。开头不属于任何奏折的话（如「一共两份：」）留在框外；不提奏折的回复照常显示。这只改画法，Router 模型和会话记录里的文字不变。</li>
+  <li>想跟某个奏折的 Worker 直接说话（追加要求、让交付后的它接着改）：<code>/ticket 12</code>、<code>/next</code> 或在右侧面板点「单聊」。点「单聊」时，左边会话里讲这张奏折的 Router 段落（以 <code>#12 · 项目 · </code> 开头、画在框里的那一段）边框变橙，顶上标「▶ 单聊中」，和右边单聊中的卡片同色，退出单聊就变回状态色；会话底部只插一行短提示，比如「▶ 单聊 #12 · …（在干）：往上数第 3 条 Router 回复讲到它，那一段已框成橙色……」，不复制卡片内容（卡片就在右边）。再点「单聊中」退出时插一行「已结束单聊，你的话回到 Router。」。提示行用 <code>$.ui.log</code>：只显示，不进 Router 模型，不写进会话记录，窗口重载后消失。<b>为什么不直接跳过去</b>：VS Code 扩展 2.1.318 里插件做不到，自动跳和点击跳都不行——<code>ui.scroll</code> 只滚底栏和面板；消息里的链接一律 <code>target="_blank"</code>，<code>#锚点</code> 不会页内跳，插件画的元素也不能设 id；聊天视图没开查找框；<code>$.session.append</code> 的 info 级提示 VS Code 也不画。单聊期间打的每句话都直接发给它，直到 <code>/router</code> 或再点一次「单聊中」；它交付（就绪）、被收或被停时单聊也自动结束：有别的提问在排队就接着单聊那个提问，没有就回到 Router，你接着说的「收了」交给 Router。受阻或失败的不自动结束，方便你在单聊里直接批准。单聊里临时想对 Router 说一句：<code>/r 你的话</code>。</li>
+  <li>Worker 交付后，面板「待我处理」里出现该奏折。面板里每张进行中的奏折是一张圆角卡片，卡片内上下左右都留了空白，分组之间的间隔比卡片之间更大：边框和左上角的编号徽标用状态色（黄＝在问你，绿＝待验收，红＝受阻/失败，蓝＝在干，灰＝排队；单聊中的那张边框变橙），标题加大加粗；第二行是项目标签（每个项目固定一种颜色，同一项目一眼认出）、状态和「几分钟前」；下方是待答问题（附可选项）或「最近消息」的全文，按 Markdown 渲染。「最近消息」是 Worker 或 agentd 对你说的最后一句：汇报、提问、权限请求、交付、受阻、失败、卡住、异常退出，按时间以最新一条为准（你自己的回答和追加指令不算；启动失败也不算，免得重试成功后还挂着旧原因）；问题挂着时只画问题，不重复；<b>你答了之后</b>，如果「最近消息」正是那个问题，下面多一行灰字「你答：…」（经 Router 转答、面板上点批准/拒绝、单聊里直接回答都算；权限请求只写「批准」或「拒绝」；问题带选项、而你只回了一个选项号，比如「B」「选 2」「b。」，就写成那个选项的全文，比如「B. 两边都做」，带了别的话的回答照原话；超过 200 字截断，全文在事件流里）。MR 奏折待审时你同意开 MR（面板上点「开 MR」或对 Router 说），那条交付说明下面写「你答：开 MR」；收、停、重试、恢复不写。不管哪种回答，Worker 一有新消息就换成新的，不再带旧回答，追加指令不算回答、也不会把它挤掉；待验收的奏折这一块叫「交付说明」。<b>「在干」的卡片在「最近消息」下面多一块「实时动作」</b>（单独的小标题，和完整的最近消息分开，免得被当成截断了的汇报）：Worker 会话里最后两条动作（它说的话，或 <code>▸ 工具 做什么</code>，如 <code>▸ Bash Run the tests</code>），每条压成一行、超过 120 字截断，Worker 每做一步就换掉，再一行「● 最近动作 14 秒前」；超过 5 分钟没有新动作，这一行变黄写「⚠ 已 N 分钟没有新动作」。数据来自守护进程 <code>GET /activity</code>：只读会话记录文件末尾 256KB、文件大小没变就用缓存；mod 每 2 秒轮询一次，只在有「在干」的奏折时才请求，并每 10 秒推一下时间，让「几秒前」持续走动而不是停在上一次的数字。已结束的奏折不画卡片，只留标题行和「打开」；这一栏按编号倒序排（新的在上），每页最多 10 张，超过 10 张时底部出现「上一页 / 第 x / n 页 / 下一页」，页码记在会话 atom <code>endedPage</code> 里，奏折过了 24 小时被移出、总页数变少时自动落到最后一页。满意就点「收」或对 Router 说「12 收了」。收会同时停掉 Worker 进程；收了还想改，就派一张新奏折。</li>
+  <li><b>「打开」</b>：Worker 还活着时，用 AppleScript 开一个 iTerm2 窗口执行 <code>claude attach &lt;bgId&gt;</code>（第一次会弹 macOS「允许控制 iTerm」的授权，点允许），挂到<i>正在后台干活的那个进程</i>上，不另起副本。关掉窗口不影响 Worker。Worker 已结束（收/停）时，改为在 VSCode 里打开它的会话记录来读。</li>
+  <li><b>卡片的按钮分三层，主次一眼可见</b>：以前一张卡片把单聊、批准、拒绝、打开、复制、展开、开 MR、放弃、重试、停全排成一行同样的按钮，看不出该按哪个。现在按「这张卡要你做什么」分层，代码在 <code>hooks/register.tsx</code> 的 <code>actions(t)</code>：
+    <ol>
+      <li><b>主操作</b>（<code>variant="primary"</code>，强调色）：每张卡至多一个，由状态决定。要权限的是「批准」（「拒绝」紧跟其后，用普通按钮）；在问你的（非权限）是「单聊」，因为答问要在单聊里答；待审的 MR 奏折是「开 MR」；待交付、没有 worktree 的是「收」；失败或受阻的是「重试」。进行中和排队的没有主操作。</li>
+      <li><b>次操作</b>（普通按钮）：「单聊」（不是主操作的时候）、「打开」，都是进入这个 Worker 的方法。</li>
+      <li><b>暗色文字链接</b>：「复制 · 放弃 · 停」，放在最后、用 · 隔开。这些操作不常用或者有风险，不该和主操作一样醒目；一直显示，不藏进「⋯」或悬停，是为了不多一次点击。它们不是 <code>Button</code>，而是 <code>textLink</code> 画出的可点 Markdown 链接（<code>[复制](https://agentd.invalid/copy-12)</code> + <code>onLinkPress</code>，key 仍是 <code>copy-&lt;id&gt;</code> 等）。原因是 VS Code 扩展（2.1.318）不认 <code>plain</code> 和 <code>variant</code>，每个 <code>Button</code> 都画成带框的按钮，CSS 是 <code>padding: 0 var(--app-spacing-medium)</code>：框的上下没有任何内边距，字贴着框，mod 也调不了。一张卡片上框一多就显得拥挤。可点的 Markdown 链接是 VS Code 唯一不加框的可按控件，所以轻量操作全部改成链接，框只留给主操作和次操作。代价：终端里这些链接只能在全屏模式下用鼠标点，不能用 ctrl+x tab 聚焦后按 Enter；VS Code 里鼠标悬停会显示占位的 <code>https://agentd.invalid/…</code>（<code>.invalid</code> 永远解析不到，万一被打开也去不了任何地方）。<code>Markdown</code> 根元素在 VS Code 里是 <code>width:100%</code>，所以 <code>textLink</code> 在外面包一层 <code>Box</code>，让它收窄到链接本身的宽度，不然没法靠右，也没法和按钮排在同一行。</li>
+    </ol>
+    确认态的代价写成单独一行：第一次点「放弃」或「停」后，链接变成「确认放弃」/「确认停止」（不再暗），操作行上方多一行警告色的「再点一次「确认放弃」：会删掉 worktree 和分支」。以前把这句话塞在按钮标签里，一下就把整行撑爆。已结束奏折那一行的「打开」、长消息的「… 展开全文 / 收起」也是同样的暗色文字链接。已结束的奏折不画框，只有两行：标题一行；项目、状态、几小时前一行，「· 打开」（停了的还有「恢复」）接在这一行末尾，不单独占一行（单独一行时，隔开会离得太远，贴紧又挤）。两张已结束的奏折之间空一行，和卡片之间的间隔一样（空两行显得太松）。<br><b>「进行中」的极简显示</b>：「进行中」标题行最右边有一个暗色链接「极简显示 / 完整显示」。默认是完整显示，也就是上面那种带框的卡片。切到极简后，这一组的每张奏折都按已结束奏折的样子画成两行：标题一行；项目、状态、几分钟前、「· 单聊 · 打开」一行；在干的奏折下面再加一行「● 最近动作 N 秒前」，安静超过 5 分钟就变成警告色的「⚠ 已 N 分钟没有新动作」。最近消息、实时动作的两行、复制和停都不画，要用的时候切回完整显示。只有「进行中」受这个开关影响，「待我处理」始终是完整卡片，因为那里是要你动手的。这个选择记在会话 atom <code>isWorkingBrief</code> 里，<code>session.start</code> 不清空它，<code>/reload-plugins</code> 之后仍然保留。宿主的竖向间距只能按整行算（<code>xs</code>/<code>sm</code> 换算出来是 0 行，VS Code 里一个数字就是一个 <code>lh</code>），所以没有比一行更细的间距可选。状态行（项目、状态、时间和末尾的链接）放不下时会折行。VS Code 里 <code>gap</code> 同时是左右和上下的间距，一折行就会空出一整行，所以面板里所有横排的 Box（标题行、状态行、操作行、按钮组、分组标题、翻页）都只用 <code>columnGap</code>，不用 <code>gap</code>。终端里横排默认不折行，看起来没有区别。这条规则有测试守着；每个「· 链接」由 <code>dotLink</code> 包成一个整体，折行时圆点跟着链接走。主操作和次操作按钮的上下内边距仍然是 0，要等扩展修复。</li>
+  <li><b>「复制」与长消息折叠</b>：VS Code 里面板上的字用鼠标选不中。这是宿主的限制：Claude Code 扩展的 webview 在根节点上设了 <code>user-select: none</code>，对话里的消息行各自又打开了选择，插件面板的容器没有；plugin API 的 <code>Box</code>/<code>Text</code>/<code>Markdown</code> 也没有样式或可选中之类的属性，mod 改不了它。卡片本身没有点击处理，不是点击吞掉了选择。所以每张进行中的卡片多一个<b>「复制」</b>按钮，用 <code>$.ui.copy</code> 把卡片上的字全部写进剪贴板（VS Code 里走 <code>vscode.env.clipboard</code>，终端里和 <code>/copy</code> 一样）：<code>#号 · 项目 · 标题（状态）</code>，然后是「它在问你 / 它要权限」和问题、可选项，或者「最近消息 / 交付说明」和 Markdown 原文，以及「你答：…」，内容由 <code>hooks/text.ts</code> 的 <code>cardText</code> 拼出。复制完会弹提示「已复制 #12 · …」，失败时提示「没能复制（原因）」。已结束的奏折没有这个按钮。<br>
+      <b>长消息折叠成四行</b>：「最近消息 / 交付说明」<i>确定</i>超过四行时只露四行（<code>Box height=4 overflow="hidden"</code>，VS Code 里是 <code>4lh</code>，终端里是 4 行；行数是 <code>hooks/text.ts</code> 的 <code>FOLD_ROWS</code>，起初是 2，用户觉得藏得太多，改成了 4），折叠开关只有一个，放在文字被截断的地方，学 Claude Code 的「… +N lines」，不再放在操作行里：折叠时四行正文下面靠右有一行暗色的「… 展开全文」（外面包一层 <code>Box justifyContent="flex-end" marginTop={1}</code>：用户要放在右下角，并且和正文隔开一行，不要贴在一起），展开后同一处变成「收起」。小标题「最近消息 / 交付说明」始终是普通文字，不能点。曾经试过把小标题也做成 ▸/▾ 开关，结果上下两个入口互相打架，而且 VS Code 显示的是按钮的 label，不是子元素，所以去掉了。复制始终复制全文。待答问题和权限请求不折叠，需要你操作的内容总是全文显示。「你答」也不折叠，放在折叠区下面。宿主不告诉 mod 渲染后有多高，VS Code 又是比例字体，所以「是否超过四行」只能按下限估算（<code>isLong</code>）：每个 Markdown 块（段落、列表项、标题、引用行、表格行、代码行）至少占一行；段落按最窄字宽算，CJK 1.6 格、其他 0.45 格，标记符号不算，再除以卡片能有的最大宽度（<code>bodyColumns − 4</code>）。这样四行以内的内容一定不会被折叠，也不会出现点了「展开」内容不变的情况；代价是实际四到五行的内容可能不折叠、全文显示。展开状态按奏折记在会话 atom <code>unfolded</code> 里，值是展开那一刻的消息原文：来了新消息就对不上，自动折回；<code>/reload-plugins</code> 或重开会话时 <code>session.start</code> 会清空它，全部恢复折叠。</li>
+  <li><b>权限审批</b>：Worker 用 <code>--permission-mode auto</code>，大部分操作由自动审查放行。被审查拒绝的那一步（比如 <code>git commit</code>）不会让奏折直接失败，而是变成一个「权限请求」送到 Router：卡片上写「它要权限」，列出命令和拒绝理由，带「批准」「拒绝」两个按钮；也可以在单聊里直接打「批准」。批准只放行<i>这一次、这一条完全相同的</i>调用，10 分钟内有效。<br>
+      已经以「受阻」交回的奏折（比如卡在 <code>git commit</code>），在单聊里直接打字即可，比如「批准提交并开 MR」：这句话会作为 Worker 自己会话里的用户消息送进去，审查认它（见 3.7）。</li>
+  <li><b>「重试」</b>：受阻或失败、且 Worker 有会话的奏折，点「重试」会停掉旧 Worker，用 <code>claude --bg --resume &lt;会话&gt;</code> 接着原对话重启（带上审批钩子），让它把上次被拒的那一步再做一次——这一次的拒绝会变成权限请求转给你。没启动过 Worker 的（例如目录未信任）仍是重新排队。</li>
+  <li><b>「恢复」</b>：你停掉的奏折（已停），在「已结束」一栏里有「恢复」按钮，Router 也可以用 <code>resume</code> 工具。Worker 接着原会话重启，第一句收到的是「你被用户中途停止过，先只读自查现场，用 report 汇报做到哪了，再用 ask 问下一步，回答之前不做任何写操作」。已收的奏折没有恢复：收＝验收结束，要改就派新奏折。</li>
+</ol>
+<p class="muted">命名：界面上叫「奏折」，提示词、Worker 看到的文字和代码里叫 ticket。</p>
+
+<h3>1.3 输入框上方那一行（band）</h3>
+<table>
+<tr><th>显示</th><th>底色</th><th>含义</th><th>你打的字去哪</th></tr>
+<tr><td><code>▶ 单聊 #12 · … · 它在等你回答<br>▶ Router 待处理 2 · 进行中 3 · …</code></td><td>Claude 橙（<code>claude</code>）</td><td>正在单聊，它有待答问题；别的奏折的事件在排队</td><td>作为答案直接送给 #12 的 Worker</td></tr>
+<tr><td><code>▶ 单聊 #12 · …（就绪）<br>▶ Router 待处理 1 · 进行中 3 · …</code></td><td>Claude 橙（<code>claude</code>）</td><td>正在单聊，它没有待答问题</td><td>作为追加指令直接送给 #12 的 Worker（已交付的会回到进行中）</td></tr>
+<tr><td><code>▶ 对 Router 说 · 待处理 2 · 进行中 3</code></td><td>警示黄（<code>warning</code>）</td><td>没在单聊，有奏折等你</td><td>给 Router</td></tr>
+<tr><td><code>▶ 对 Router 说 · 待处理 0 · 进行中 3</code></td><td>绿（<code>success</code>）</td><td>没在单聊，也没有等你的</td><td>给 Router</td></tr>
+<tr><td><code>⚠ agentd 守护进程不在线</code></td><td>红（<code>error</code>）</td><td>连不上守护进程</td><td>给 Router；<code>/agentd start</code> 重启</td></tr>
+</table>
+
+<p>单聊时 band 也一直带着 Router 的「待处理 · 进行中」，数字和不单聊时一样算（待处理＝所有等你的奏折，进行中＝在干＋排队），不用退出单聊就能看到全局。mod 里单聊的 band 固定两行：第一行是奏折，第二行从「▶ Router」起写数字和操作提示，标题长短不影响数字的位置。哪一行放不下都换行，不截断（mod 里 <code>Text wrap="wrap"</code>，dsh 里 <code>.sa-band-text</code> 允许折行）。DeepSeek Harness 版的 Worker 会话 band 同样带着，写法沿用它 Router band 的规则，为 0 的项不显示：<code>单聊 #2 · p · t2（等你）· Router 待处理 1 · 进行中 2</code>（<code>packages/dsh-superagent/src/client/view.ts</code> 的 <code>bandText</code>）。</p>
+<p>只有两种去向：橙色＝单聊，你的话直接进 Worker；其余＝对 Router 说（黄＝有事等你，绿＝无事），红＝守护进程挂了。单聊时要收或停，点面板按钮或用 <code>/r 12 收了</code>——直接打「收了」会发给 Worker。颜色用主题键，跟随你的 VSCode 主题（见 <code>hooks/text.ts</code> 的 <code>bandFill</code>）。外面那层「From the agentd-router plugin」边框是引擎画的，插件改不了。</p>
+
+<h3>1.4 命令</h3>
+<table>
+<tr><td><code>/next</code></td><td>单聊下一个等你的奏折（先问题，后其他交付），并把它的问题或交付再贴一次</td></tr>
+<tr><td><code>/ticket 12</code> · <code>/router</code></td><td>开始和 #12 单聊 / 结束单聊、回到对 Router 说</td></tr>
+<tr><td><code>/tickets</code></td><td>在聊天里打印奏折总览</td></tr>
+<tr><td><code>/r 话</code></td><td>直通状态下强制对 Router 说</td></tr>
+<tr><td><code>/agentd status</code> · <code>/agentd start</code> · <code>/agentd restart</code></td><td>守护进程状态 / 启动 / 重启（<code>pnpm build</code> 之后用；启动时插件也会提示守护进程是否过期）</td></tr>
+</table>
+
+<h3>1.5 不经 Router 的命令行</h3>
+<pre><code>node packages/agentd/dist/agentd.mjs status
+node packages/agentd/dist/agentd.mjs tickets --all
+node packages/agentd/dist/agentd.mjs projects --rescan
+node packages/agentd/dist/agentd.mjs dispatch memos "加搜索框" "给列表加一个搜索框"</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="arch">2. 架构</h2>
+<pre>
+ VSCode · router/ 工作区
+ ┌──────────────────────────────────────────────┐
+ │ Router 会话（Claude Code，sonnet）             │
+ │  └ agentd-router 插件（packages/router-mod）   │
+ │     Pane「奏折」· band · /next · 9 个工具       │
+ │     禁用 Bash/Edit/Write/Read/Grep/Agent…      │
+ └───────┬───────────────────────┬──────────────┘
+   HTTP  │ $.http.fetch          │ $.session.send（追加指令 / 唤醒）
+         ▼                       ▼
+ ┌───────────────────────┐   ┌──────────────────────────────┐
+ │ agentd 守护进程         │   │ Worker 会话（opus）            │
+ │ 127.0.0.1:7707         │   │ claude --bg -n agentd-w-12    │
+ │ SQLite：奏折/事件/问题  │◄──│ cwd = 项目目录                 │
+ │ 派工 · 跟踪 · 排队      │   │ MCP：report / ask / done      │
+ └───────────┬───────────┘   └──────────────────────────────┘
+             │ claude --bg … / claude agents --json --all
+             └──────────────► Claude Code 后台会话管理
+</pre>
+<table>
+<tr><th>单元</th><th>位置</th><th>职责</th></tr>
+<tr><td>守护进程</td><td><code>packages/agentd/src/</code> → <code>dist/agentd.mjs</code></td><td>事实源。存奏折、事件、问题；扫描项目；派 Worker；跟踪 Worker 进程；提供 HTTP API。没有 LLM，没有 UI。</td></tr>
+<tr><td>Worker 侧 MCP</td><td><code>packages/agentd/src/mcp/</code> → <code>dist/agentd-mcp.mjs</code></td><td>Worker 唯一的对外通道：<code>report</code>、<code>ask</code>（记下问题立即返回，回答以消息送达）、<code>done</code>。是 HTTP API 的薄壳。</td></tr>
+<tr><td>Router 插件</td><td><code>packages/router-mod/</code></td><td>Claude Code mod。批量注入事件、画 Pane 与 band、注册 Router 工具、禁执行类工具、直通回答、自动拉起守护进程。</td></tr>
+<tr><td>Router 工作区</td><td><code>router/</code></td><td>含标记文件 <code>.agentd-router</code>。插件只在这里生效；仓库根照常用于开发 agentd 本身。</td></tr>
+</table>
+
+<h3>2.1 守护进程模块</h3>
+<table>
+<tr><td><code>state.ts</code></td><td>奏折状态机：一张表，<code>transition(state, input)</code>。所有状态变化都经过它。</td></tr>
+<tr><td><code>store.ts</code></td><td>SQLite 存储。每次状态变化在一个事务里完成「读状态 → 查表 → 写状态 → 记事件」。</td></tr>
+<tr><td><code>daemon.ts</code></td><td>业务：派工、回答、消息、关闭、停止、重试、恢复；Worker 回调；事件长轮询；调度循环 <code>tick()</code>。</td></tr>
+<tr><td><code>claude.ts</code></td><td>与 Claude CLI 的边界：拼 <code>claude --bg</code> 参数、解析输出、读 <code>claude agents --json --all</code>。接口 <code>WorkerRuntime</code>，测试用假实现。</td></tr>
+<tr><td><code>projects.ts</code></td><td>扫描 roots 下的 git 仓库，按真实路径去重（软链接或重叠的根不会重复），同名仓库加父目录区分；解析项目名，只放行唯一匹配。</td></tr>
+<tr><td><code>transcript.ts</code></td><td>按 sessionId 找 Worker 的 jsonl，只读尾部，抽出对话行。</td></tr>
+<tr><td><code>http.ts</code> · <code>cli.ts</code></td><td>HTTP 路由（只绑 127.0.0.1）；命令行入口。</td></tr>
+<tr><td><code>worker-prompt.ts</code></td><td>追加到每个 Worker 系统提示的规则。</td></tr>
+<tr><td><code>permission.ts</code> · <code>hook.ts</code></td><td>权限审批：Worker 钩子的 settings、问题文案、批准词判定、<code>grantKey</code>；<code>hook.ts</code> 构建成 <code>dist/agentd-hook.mjs</code>，是钩子命令的入口。</td></tr>
+</table>
+
+<h3>2.2 奏折状态</h3>
+<table>
+<tr><th>状态</th><th>含义</th><th>面板分组</th></tr>
+<tr><td>queued</td><td>排队：local 项目里已有写入 Worker 在跑，或并发已满</td><td>进行中</td></tr>
+<tr><td>working</td><td>Worker 在干</td><td>进行中</td></tr>
+<tr><td>asking</td><td>有待答问题。普通提问时 Worker 不停：做只读准备或结束本轮；权限请求时 Worker 停在钩子里等</td><td>待我处理</td></tr>
+<tr><td>ready</td><td>Worker 交付，待验收</td><td>待我处理</td></tr>
+<tr><td>blocked</td><td>Worker 卡住；或 Worker 停下却没汇报（stalled）</td><td>待我处理</td></tr>
+<tr><td>failed</td><td>启动失败、进程消失、Worker 报告失败</td><td>待我处理</td></tr>
+<tr><td>done</td><td>你验收关闭（同时停掉 Worker，不能再发消息），或 Worker 判断无事可做（Worker 还在，发消息会重新打开）</td><td>已结束</td></tr>
+<tr><td>stopped</td><td>你叫停。不再接受任何输入</td><td>已结束</td></tr>
+</table>
+<p>MR 奏折（见 3.8）没有自己的状态，面板按阶段换个说法：ready 且还没开 MR 显示「待审」，开了 MR 之后的 working 显示「MR 中」。合入后直接进 done。</p>
+
+<!-- ============================================================ -->
+<h2 id="mech">3. 机制原理</h2>
+
+<h3>3.1 PDF 机制在这里的落地</h3>
+<table>
+<tr><th>PDF</th><th>这里</th></tr>
+<tr><td>Router 不执行、只路由</td><td>插件的 <code>tool.call</code> 钩子在 Router 会话里拒绝 Bash、Edit、Write、NotebookEdit、Agent，也拒绝 Read、Grep、Glob、WebFetch、WebSearch——Router 连代码都不读，要看什么就派奏折。Router 只有 9 个 agentd 工具。</td></tr>
+<tr><td>批处理（Batching）</td><td>插件每 2 秒拉一次事件流。需要人处理的事件先入队；Router 不在推理、且 1.5 秒内没有新事件时，整队合并成一条「[agentd] N 条新事件」注入，Router 一轮处理完。</td></tr>
+<tr><td>Inline &amp; Spill</td><td>注入的每条事件只带奏折头和 ≤300 字摘要，被截断时注明。全文留在库里。</td></tr>
+<tr><td>局部性 Inline</td><td>提问、受阻、失败、卡住、退出这几类事件额外带上该奏折<b>在它之前</b>的最后一条进展汇报（同样 ≤300 字），Router 转述时知道 Worker 做到哪了，不必先 <code>read</code>。就绪不带（它本身就是结果）；单个奏折的 <code>read events</code> 不带（进展已在列表里）。</td></tr>
+<tr><td>链式召回</td><td><code>read</code> 工具三跳：summary（任务原文、最近消息、待答问题；两者相同时只列待答问题；最近消息是你答过的问题时，下一行附「你答：…」，和面板一致）→ events（事件全文）→ transcript（Worker 会话尾部）。</td></tr>
+<tr><td>长程记忆</td><td>事实源是 SQLite，不是 Router 的 transcript。会话首条消息附带奏折总览；compact 时追加「保留未结束奏折与单聊对象」的指令，压缩完成后的下一条消息重新附带一份从守护进程现取的总览，不靠摘要记住奏折状态。</td></tr>
+<tr><td>订阅直通（Fast Path）</td><td>单聊时你的话由插件直接送给 Worker（有待答问题就是答案，否则是追加指令），返回 <code>{ drop }</code> 不进 Router 模型，同时在 Router 对话里记一行「用户已直接回答 #12…」或「用户直接对 #12 的 Worker 说…」，保持 Router 的上下文完整。送不到时这句话改交 Router，并附上原因。</td></tr>
+<tr><td>Worker 不直接对人说话</td><td>Worker 的 <code>AskUserQuestion</code> 被禁用，系统提示要求只用三个 agentd 工具对外。</td></tr>
+<tr><td>持久与自愈</td><td>Worker 是 <code>claude --bg</code> 后台会话，不依赖 VSCode。守护进程每 3 秒对账：Worker 进程消失（<code>claude agents</code> 条目没有 <code>pid</code>）且没 <code>done</code> 记为失败；Worker 空闲超过 45 秒仍在 working 记为 stalled。</td></tr>
+</table>
+
+<h3>3.2 一个问题的往返（非阻塞，PDF §4.1 的异步 ReAct）</h3>
+<ol>
+  <li>Worker 调 <code>mcp__agentd__ask</code>。MCP server <code>POST /tickets/12/ask</code> 建问题，奏折进入 asking，工具<b>立即返回</b>「问题已送出，不用等」。</li>
+  <li>Worker 只做不依赖答案的只读准备，没有可做的就结束本轮，不调 <code>done</code>（<code>done</code> 会撤回问题）。asking 的奏折不算 stalled。</li>
+  <li>插件拉到 ask 事件，入队；没有单聊时自动单聊 #12；Router 空闲后注入，Router 转述。</li>
+  <li>你在单聊里打字（或 Router 调 <code>answer</code>）。插件 <code>POST /tickets/12/answer</code> 记下回答，奏折回到 working；接口返回 <code>hadWaiter: false</code>，插件用 <code>$.session.send</code> 把「【agentd ticket #12 回答】…」送进 Worker 会话。Worker 空闲则约 1 秒后开新一轮；正在跑工具则等这次调用结束，和工具结果一起读到（实验 S6）。送不到时如实报告「回答已记下，但没送到」。</li>
+  <li>提问期间也能追加指令：<code>message</code> 照常送达，奏折保持 asking，问题不撤回。</li>
+  <li>问题没答完奏折就被收、停或 Worker 退出时，问题自动撤回。</li>
+  <li>权限请求不同：钩子必须返回一个决定，所以仍是阻塞的，循环 <code>GET /questions/:id?wait=25</code>；答复接口对它恒返回 <code>hadWaiter: true</code>，插件不发消息。Worker 停在钩子里时 <code>message</code> 会被拒绝，请用 <code>answer</code>。</li>
+</ol>
+
+<h3>3.4 给 Worker 追加指令</h3>
+<p><code>message</code> 工具先 <code>$.session.send</code> 把话送进 Worker 会话，<b>送达之后</b>才 <code>POST /tickets/:id/message</code> 记录并把奏折推回 working。送不到（Worker 会话已不在）直接报错，奏折状态不动——否则会出现「奏折显示进行中、Worker 其实什么都没收到」。</p>
+
+<h3>3.5 权限审批</h3>
+<p>Worker 启动时带 <code>--settings</code>，里面挂三个钩子，都调用 <code>agentd-hook.mjs</code>（和守护进程一起构建、复制进插件）：</p>
+<table>
+<tr><th>钩子</th><th>何时</th><th>做什么</th></tr>
+<tr><td><code>PermissionDenied</code></td><td>auto 审查拒绝了一次调用</td><td>把命令和拒绝理由作为 <code>kind: permission</code> 的问题 <code>POST /tickets/:id/ask</code>，带上这次调用的 <code>grantKey</code>（工具名 + 参数，去掉 description），然后长轮询等你回答。批准 → 输出 <code>retry: true</code>，Worker 原样再调一次；否则什么都不输出，拒绝照旧成立。</td></tr>
+<tr><td><code>PreToolUse</code></td><td>每次工具调用前</td><td>只有标记文件 <code>~/.agentd/mcp/&lt;id&gt;.grant</code> 存在时才启动 node，<code>POST /tickets/:id/grants/take</code>。守护进程手里有与这次调用 <code>grantKey</code> 相同、未过期的批准 → 消耗掉它并输出 <code>permissionDecision: allow</code>。</td></tr>
+<tr><td><code>PermissionRequest</code></td><td>需要人点批准的弹窗（auto 模式下少见）</td><td>同样转成权限请求，按你的回答输出 allow / deny。</td></tr>
+</table>
+<p>批准由<b>守护进程</b>记账（内存里，10 分钟过期，一次一用），标记文件只是「此刻有没有待用的批准」的快速判断，Worker 自己写这个文件也拿不到放行。你的回答只有「批准」「准」「同意」「可以」「ok」这类明确的肯定词才算批准，其余一律当拒绝。</p>
+
+<h3>3.6 重试 = 接着原会话重启</h3>
+<p>钩子只能在 Worker 启动时挂上。旧版本启动的、或已经交回 blocked/failed 的 Worker，「重试」走 <code>relaunch</code>：先 <code>claude stop</code> 旧进程，再 <code>claude --bg --resume &lt;sessionId&gt;</code> 带上新的 settings 和一句「从上次停下的地方继续，被拒的那一步原样再做一次」。必须先停：对运行中的会话 <code>--resume</code> 会开出第二个进程。</p>
+<p><b>恢复（resume）与重试分开。</b>两者都走 <code>relaunch</code>，但前提和送给 Worker 的话不同：重试针对 Worker 自己交回的 blocked/failed，让它把被拒的那一步再做一次；恢复针对你中途叫停的 stopped，Worker 不知道自己被打断，现场可能是半途，所以只让它自查、汇报、提问。stopped 已经释放了项目，恢复前要重新检查：同项目没有别的非 worktree 奏折占着、Worker 没满、目录还在、有会话可接，任一不满足就拒绝并说明原因。恢复启动的几秒里，同项目的排队奏折不会被同时拉起（<code>launchQueued</code> 把正在启动的奏折的项目也算作占用）。对已停的奏折 <code>retry</code> 或 <code>message</code> 会直接提示「用恢复」，不再给出「Worker 还在」这种误导。</p>
+
+<h3>3.7 单聊里对受阻奏折说话 = 在它的会话里亲口说</h3>
+<p>Worker 的自动审查只认<b>它自己会话里的用户消息</b>。插件 <code>$.session.send</code> 发过去的是「另一个会话发来的消息」，<code>ask</code> 的回答是工具结果，两者里的「批准」审查都不认，所以 #6 这类卡在 <code>git commit</code> 上的奏折，从 Router 转达多少次批准都没用。</p>
+<p>因此：单聊一张 <b>blocked/failed</b> 且有会话的奏折时，你打的字不走 <code>session.send</code>，而是 <code>POST /tickets/:id/say</code>：守护进程先停旧进程，再 <code>claude --bg --resume &lt;会话&gt; "&lt;你的原文&gt;"</code>。这句话成了那个会话里的用户消息，和你 attach 进去亲手打字等价，里面的批准审查会认。只有 <code>prompt.submit</code> 里你本人的输入走这条路；Router 模型调 <code>message</code> 工具转达的话，永远是普通的会话间消息。进行中（working/asking）的奏折不走这条路，免得打断它正在跑的一轮。</p>
+
+<h3>3.3 派工</h3>
+<pre><code>cd &lt;项目&gt; &amp;&amp; claude --bg --mcp-config ~/.agentd/mcp/12.json --model opus \
+  --allowedTools mcp__agentd__report,mcp__agentd__ask,mcp__agentd__done \
+  --permission-mode auto --settings '&lt;审批钩子&gt;' --disallowedTools AskUserQuestion \
+  --append-system-prompt "&lt;Worker 规则&gt;" [--resume &lt;会话&gt;] -n agentd-w-12 "【agentd ticket #12】…"</code></pre>
+<p>只读奏折多一个 <code>--disallowedTools AskUserQuestion,Edit,Write,NotebookEdit</code>。MR 奏折的 <code>cd</code> 目标是守护进程先建好的 worktree，不用 <code>claude --worktree</code>：那样会基于本地 HEAD，而 MR 必须基于最新的 origin/main。</p>
+
+<h3>3.8 并行派工：只读奏折与 MR 奏折</h3>
+<p>原来同一项目同时只能有一个 Worker，因为它们都在同一个目录、同一个分支上写。现在按「写不写」「写在哪」分三种：</p>
+<table>
+<tr><th>奏折</th><th>在哪干</th><th>占不占项目</th><th>怎么结束</th></tr>
+<tr><td>只读（Router 派工时 <code>readonly: true</code>）</td><td>项目主目录</td><td>不占，也不被占用拦住</td><td>ready → 收</td></tr>
+<tr><td>MR 项目里的写入奏折</td><td>自己的 worktree <code>&lt;项目&gt;/.claude/worktrees/agentd-&lt;id&gt;-&lt;戳&gt;</code>，分支 <code>agentd/&lt;id&gt;-&lt;戳&gt;</code>，从最新 origin/main 拉出</td><td>不占</td><td>待审 → 开 MR → 合入后自动结束并清理；或「放弃」</td></tr>
+<tr><td>local 项目里的写入奏折</td><td>项目主目录、当前分支</td><td>占，到收或停为止</td><td>ready → 收（不变）</td></tr>
+</table>
+<p>哪些项目是 MR 项目，由 <code>~/.agentd/config.json</code> 的 <code>projects</code> 按路径指定（6.1），没写的都是 local。只读奏折和 MR 奏折都照样受 <code>maxConcurrent</code> 限制。</p>
+<p>配成 mr 的项目，派工时守护进程还要在本地看一眼仓库（<code>lanes.ts</code> 的 <code>probeOrigin</code> / <code>whyLocal</code>，只读本地，不联网）：没有 origin、本地没有 <code>origin/main</code>、或 origin 在 github.com 上而 owner 不在 <code>githubOwners</code> 里，这张写入奏折就退回 local（主目录、串行），Router 拿到的派工结果后面附一句原因。所以整个 GitHub 目录设成 mr 也安全：master 分支的、没远端的、别人项目的克隆都照旧串行。已派出的奏折不受影响，它是不是 MR 奏折在派工那一刻定下。</p>
+<p>MR 奏折的一生：</p>
+<ol>
+  <li><b>派工</b>：守护进程 <code>git fetch origin main</code>，建 worktree 和分支，把 Worker 起在 worktree 里。Worker 的规则 3 写明分支名、不碰项目主目录、依赖自己按项目文档准备。</li>
+  <li><b>做完先交回</b>：Worker 不 commit 不 push，<code>done(ready)</code>。面板显示「待审」，按钮是「开 MR」「放弃」，没有「收」。</li>
+  <li><b>开 MR</b>：你点「开 MR」（或对 Router 说），插件先记 <code>open_mr</code>，再把「【奏折 #N 开 MR】…」送进 Worker 的会话；没送到就调 <code>/open_mr/undo</code> 撤回，奏折回到「待审」。你同意时附带的话（比如「先验证，然后开 MR」），Router 写进 <code>open_mr</code> 的 <code>text</code>，接在固定那句后面（「用户另外交代：…」）一起送去，不会另用 <code>message</code> 转达。<b>开 MR 只认 agentd 的记录</b>（<code>mr_opened_at</code>），不认消息里的字：谁都能在 Worker 会话里打出「【奏折 #N 开 MR】」，agentd 却不知道（#39 就是这样合入后收不了尾，#27 也卡过）。没有记录时 <code>done(merged)</code> 会被拒。所以 Worker 收到这条消息、或有人让它开 MR、commit、合入时，先调 <code>mr_consent</code>（dsh：<code>superagent_mr_consent</code>）查记录。已记下就开；没记下时，奏折若还是「待审」就不调 report/done，只在会话里回一句请你点「开 MR」，免得奏折离开待审、按钮消失；奏折若已被消息叫醒（working），就照做别的要求，最后 <code>done(ready)</code> 交回，按钮重新出现。回答文案在 <code>lane-rules.ts</code> 的 <code>mrConsentAnswer</code>，两边宿主共用。已经开了 MR 之后在单聊里批准提交之类的话不受影响。dsh 的 <code>superagent_open_mr</code> 同样带 <code>text</code>。Worker 接着 commit、push、开向 main 的 MR（合入后删除源分支）。怎么开 MR、怎么设自动合并，照目标项目 AGENTS.md / CLAUDE.md 的合并说明做，项目文档优先于合并脚本；合并人以用户本人为准，项目文档没要求就不用机器人令牌合并。项目文档没写怎么合并时才退回项目的自动合并脚本，并在汇报里写明合并人会是谁。然后盯着流水线：失败就修，落后就 rebase，只动自己的 MR。规则只写原则和优先级，不写某个项目的具体命令。origin 在 github.com 的项目，规则 3 b 换成 GitHub 版：MR 就是 PR，项目文档没写时用 <code>gh pr create</code> 开、<code>gh pr merge --auto --squash --delete-branch</code> 设自动合并（gh 登录的是你本人的账号；仓库没开自动合并就等检查过了直接合，不用 <code>--admin</code> 绕过），<code>gh pr checks --watch</code> 盯着，合入后源分支还在就自己删掉；gh 没登录就 ask 你去 <code>gh auth login</code>。其余主机一律按 GitLab 的原文，acme 一字不变。</li>
+  <li><b>合入</b>：Worker <code>done(merged)</code>。守护进程不信口头：先 <code>git ls-remote</code> 看 origin 上这个分支还在不在，还在就拒绝（MR 没合，或没设删源分支）。通过后奏折进 done，停掉 Worker，删 worktree 和本地分支。</li>
+  <li><b>放弃</b>：合入前任何时候点「放弃」（第二下确认），或 Router 带 <code>discard=true</code> 收。直接删 worktree 和分支。不带 discard 的收会被拒，提醒先跟你确认。</li>
+</ol>
+<p>清理规则（偏差 P4）：合入后的 worktree 若还有未提交改动就保留，面板上记一条「保留了 …」等你看；放弃和 dropped 直接删。分支一律 <code>git branch -D</code>，删前把分支头存到 <code>refs/trash/&lt;分支名&gt;</code>，提交不会真丢。守护进程启动时补扫一遍上次没清干净的。</p>
+<p>会话 ID 由 <code>--bg</code> 自己分配，守护进程随后从 <code>claude agents --json --all</code> 按名字取回，用于 transcript 读取和 VSCode deeplink。</p>
+
+<!-- ============================================================ -->
+<h2 id="subtle">4. 微妙之处</h2>
+<ul>
+  <li><b>目录必须先被信任。</b><code>claude --bg</code> 在未信任的目录直接拒绝，父目录的信任不继承；但已信任仓库的 worktree 能直接起，所以 MR 奏折的 worktree 不用另外信任。这种奏折会进入 failed，原因写明「请在该目录运行一次 claude 并接受信任提示」，处理后点「重试」。agentd 不代你写信任记录。</li>
+  <li><b>注入可能被拒。</b>会话启动后你还没说过话、或你按 Esc 打断之后，引擎不允许插件开新回合。此时事件留在队列，band 显示「N 条新事件待送达」，随你的下一句话作为附加上下文一起给 Router。</li>
+  <li><b>焦点从不被抢。</b>焦点只在为空时自动给提问的奏折。否则你以为在回答 #12，却被送到了 #13。多个奏折同时提问时，Router 会一个一个来，你用 <code>/next</code> 切换。</li>
+  <li><b>收即停。</b>每个空闲的后台 Worker 都是一个常驻的 Claude Code 进程。「收」在关闭奏折的同时执行 <code>claude stop</code>，否则空闲 Worker 会越积越多。会话记录仍在磁盘上。停失败（Worker 已不在）只记日志，不影响关闭。</li>
+  <li><b>local 项目的写入奏折串行，占到 close/stop 为止。</b>同一项目主目录里同时只有一个写入 Worker。交付（ready/blocked/failed）<i>不</i>让出项目——Worker 还在那个工作区，你随时可能叫它接着改。只有「收」或「停」才放下一张排队的进去。只读奏折和 MR 奏折不受这条限制（3.8）。</li>
+  <li><b>只读靠拿掉写工具 + 规则，不是 plan 模式。</b>后台会话里 plan 模式对写操作、甚至对 agentd 自己的 report 都弹确认，没人能点，Worker 就卡住（偏差 P1）。只读 Worker 没有 Edit / Write，Bash 只靠规则约束。</li>
+  <li><b>MR 阶段 Worker 要一直挂着。</b>等流水线可能几十分钟。Worker 把查 MR 状态的命令（项目文档给的方式，或退回时的自动合并脚本）放后台跑、前台定期看输出，本轮不结束；它停下不汇报，照常会在 45 秒后被判 stalled。</li>
+  <li><b>MR 奏折结束后不能再发消息。</b>合入、放弃、dropped 都停掉 Worker 并删 worktree；要接着改就派新奏折。</li>
+  <li><b>Worker 存活只看 pid。</b><code>claude agents</code> 对空闲的活会话也会报 <code>state: done</code>；真正结束的会话是没有 <code>pid</code> 字段。守护进程只认后者，不然正在等你答复的 Worker 会被误判为退出。</li>
+  <li><b>单聊跟着奏折走。</b>单聊的奏折交付（就绪）、无事可做、合入、被收、停或从列表消失，单聊自动结束，你的话不会发给一个已不存在或已经交差的 Worker。「交付」按这一轮新到的 <code>ready</code> 事件判断（<code>poll()</code>），不看状态：对一张早已交付的奏折开单聊让它接着改，不会被立刻踢回 Router。受阻、失败不结束（你多半要在单聊里亲口批准，见 3.7）；单聊奏折还有待答问题或权限请求时也不结束。结束后统一走 <code>endChat</code>：有别的奏折在等回答就交给等得最久的那个，没有才回到 Router。只有你主动离开（<code>/router</code>、面板「单聊中」）一律回 Router，即使有提问在排队。</li>
+  <li><b>自动单聊只管一问，答完传给下一问。</b>提问奏折自动打开的单聊，在它的问题消失时结束：你在单聊里答了、在面板上批了、经 Router 的 <code>answer</code> 答了、问题被撤回，或者奏折结束了。结束后单聊交给等得最久的下一个提问（按 <code>updatedAt</code>），没有就回到 Router。判断放在 <code>refresh()</code> 里，所以不管从哪条路答的都生效。你自己打开的单聊（<code>/ticket</code>、<code>/next</code>、面板按钮）答完也保持（那是你主动选的对象），直到它交付、被收或被停（见上一条，结束时同样交给下一个提问），或者你自己结束它。单聊从不被抢：新的提问不会把你从当前单聊里拉走。</li>
+  <li><b>回答期间其他奏折的事件全扣。</b><code>takeEvents()</code> 在你正回答某个奏折时，把<i>其他</i>奏折的事件全部留在队列里。队列里本来就只有要你回话的事件（提问、交付、受阻、失败、无事可做、停下没汇报、异常退出、启动失败；进度不进队列），每一种都可能让你接一句话，而这句话在单聊里会发给正在单聊的 Worker。正在回答的那个奏折自己的事件不扣。批量注入和「随你下一句话附带」两条路都走 <code>takeEvents()</code>，按事件 id 取走，不按位置，因为轮询和回合结束都可能同时往队列里写。你用 <code>/router</code> 主动离开单聊时，排队的提问在下一次轮询时一起交给 Router。</li>
+  <li><b>分框靠 Router 的写法。</b>切分规则在 <code>hooks/text.ts</code> 的 <code>ticketSections</code>：一行以 <code>#12 · 项目 · </code> 开头（前面可以有 <code>1. </code>、<code>- </code>、<code>### </code>、<code>**</code> 这类 Markdown 标记），就开始一个新框，直到下一个这样的行；行中间提到的 #号不算。依据是 Router 提示词要求「每个 ticket 一段，以 #号 · 项目 · 标题开头」。模型偶尔不照写时，那段话就不进框，照常显示，不会画错。</li>
+  <li><b>守护进程会过期。</b>它是常驻进程，<code>pnpm build</code> 后仍跑旧代码。插件问 <code>/status?script=&lt;插件自己的 daemon/agentd.mjs&gt;</code>，守护进程比较那个文件和自己启动时那份的内容哈希（sha256），不比路径也不比 mtime：从市场装的插件每个版本放在各自的缓存目录，新版本是另一个文件，守护进程启动用的那份原样不动，比 mtime 永远发现不了；比内容也让 <code>pnpm serve</code>（跑 <code>dist/</code> 里那份）不会被误判。插件启动时发现过期会提示你 <code>/agentd restart</code>。restart 先发 <code>/shutdown</code>；对方没有这条路由（早期构建）或 5 秒内没退，就按 <code>/status</code> 报的 pid 发 SIGTERM；还在就明说失败，不会假报「已在线」。确认换成功：<code>/agentd status</code> 里的 pid 变了。</li>
+  <li><b>transcript 不一定在「cwd 转义」目录里。</b>本机上 <code>/private/tmp/…/proj</code> 的会话落在 <code>-private-tmp-agentd-spike-proj</code> 下，所以按 sessionId 全目录搜索。</li>
+  <li><b>VSCode 的 deeplink 只在会话所属文件夹的窗口里生效。</b>已结束奏折的「打开」先 <code>open -a "Visual Studio Code" &lt;项目&gt;</code> 聚焦那个窗口，再发 deeplink。活着的 Worker 不走这条路：deeplink / <code>--resume</code> 会对同一会话另起一个进程。</li>
+  <li><b>权限审批尚待实测的两点。</b>①PreToolUse 返回 allow 能否压过 auto 审查对同一调用的再次拒绝；②PermissionDenied 钩子等你回答时（最长 24 小时）Worker 是否真的停在那里。单元与端到端测试只证明 agentd 这一侧的往返正确。若 ① 不成立，备选方案是 Worker 改用 <code>acceptEdits</code> + PermissionRequest 钩子。</li>
+  <li><b>同一时刻只能挂一个权限请求。</b>奏折处于 asking 时第二个被拒的调用不再提问，拒绝照旧成立，Worker 按规则换路或交回 blocked。批准存在内存里，守护进程重启会丢——后果只是那一步再被拒一次。</li>
+  <li><b>权限模式要一致。</b>跨会话消息在接收方权限模式不同时会被扣下等批准。Router 与 Worker 都用 auto。</li>
+  <li><b>守护进程的生命期。</b>插件以 <code>serve --detach</code> 启动它，它脱离会话独立运行；没有进行中的奏折且 30 分钟无请求时自行退出，下次打开 Router 时再被拉起。Worker 在它不在线时调用工具会得到「agentd 不在线」，<code>ask</code> 会自动重连等待。</li>
+  <li><b>mod 的写法限制。</b>引擎静态分析 mod：不能把 <code>$</code> 作为参数传递，<code>atom</code> 的 plugin 名必须是字面量，同一事件不能注册两个无 matcher 的钩子，命令名不能与内置命令重名。</li>
+  <li><b>直通的提示文案。</b>直通时引擎会显示一行「Prompt dropped by a hook: 已直通 #12 …」。这是引擎对 <code>{ drop }</code> 的固定前缀，不是出错。</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="dev">5. 开发与测试</h2>
+<pre><code>pnpm check            # 隐私检查 + typecheck + eslint + vitest + build
+pnpm check:sensitive  # 只扫隐私：全部受控文件
+pnpm test           # 守护进程与 MCP 的 vitest（HTTP 测试要监听本地端口）
+cd packages/router-mod
+claude plugin validate .
+claude plugin test .  # mod 的测试：引擎替身 + 假守护进程</code></pre>
+<table>
+<tr><th>测试</th><th>覆盖</th></tr>
+<tr><td><code>state.test.ts</code></td><td>状态机穷举：8 个状态 × 15 个输入，每格都写明结果</td></tr>
+<tr><td><code>store.test.ts</code></td><td>事务原子性、问答往返、离开 asking 自动撤回、重开、截断、迁移、项目重命名、列表过滤与未答问题联查、最近消息与其下的「你答」（权限只记批准/拒绝、只回选项号时换成选项全文、截断、新消息清掉、追加指令不清）</td></tr>
+<tr><td><code>daemon.test.ts</code></td><td>派工、同项目串行（占到 close）、并发上限、启动失败与重试、恢复（会话、占用、并发、目录、启动中不撞项目）、stalled、进程消失（无 pid）、停止、撤回等待者、长轮询、回答是否需要插件代发（普通提问要，权限请求不要）；开 MR 在交付说明下记「你答：开 MR」，追加指令、停、恢复、收不记；activity 只给在干的奏折</td></tr>
+<tr><td><code>http-mcp.test.ts</code></td><td>HTTP + MCP 端到端：派工 → 汇报 → 提问（立即返回，第二问被拒）→ 回答 → 交付 → 关闭</td></tr>
+<tr><td><code>projects.test.ts</code> · <code>claude.test.ts</code></td><td>扫描与命名、解析歧义；参数顺序、输出解析、transcript 读取；最近动作（工具按「做什么」显示、截成一行、文件变大才重读）</td></tr>
+<tr><td><code>router-mod/tests/router.test.tsx</code></td><td>非 Router 目录不生效；工具与命令注册；band 文案与底色；单聊（回答、追加指令、送不到改交 Router、自动单聊答完即止、自己开的单聊交付后回 Router 或交给排队的提问、受阻时保持）；回答一个提问时其他奏折的事件全部排队、答完单聊交给下一个提问；Router 回复按奏折切分、每段画进项目色的框；禁 Bash/Read/WebFetch；message 先送达再记录；派工；面板点「单聊」时用 <code>$.ui.log</code> 插一行短提示（不含卡片内容）、退出时插「已结束单聊」；<code>mentionDepth</code> 数往上第几条 Router 回复讲到它；单聊中的奏折在 Router 回复里的段落框成橙色并标「▶ 单聊中」，退出后变回状态色；面板分组与按钮、编号徽标与项目标签、汇报与问题以 Markdown 全文画出、小标题叫「最近消息」；read summary 的最近消息不与待答问题重复；答过的问题在卡片与 read summary 里附「你答：」；状态色、项目色与「几分钟前」；停止二次确认；批处理注入与自动单聊；压缩后重发奏折总览；权限请求的批准/拒绝按钮；受阻奏折的重试；已停奏折的「恢复」按钮（已收的没有）；「已结束」按编号倒序、每页 10 张翻页与对已停奏折发消息的提示；单聊受阻奏折时你的话走 say（Router 转达的不走）；「打开」对活 Worker 用 iTerm2 attach、对已结束的用 VSCode；在干的卡片在「最近消息」下面以「实时动作」为小标题显示最后两行动作与「几秒前」、久无动作变黄、没有在干的就不请求 /activity；「复制」的全文（问题、可选项、最近消息原文、你答）、复制到按下的那个 surface、复制失败的提示，已结束的奏折没有这个按钮；长消息的下限行数估算（块数、软换行、表格分隔行、代码块、CJK 与标记的宽度、还没测宽时只看块数），折叠成四行、截断处唯一的「… 展开全文 / 收起」开关；卡片按钮的主次分层（各状态的主操作、复制/停/放弃是暗色链接）与「确认放弃 / 确认停止」的警告行，问题不折叠，来了新消息或重载后恢复折叠</td></tr>
+<tr><td><code>permission.test.ts</code></td><td>批准词判定、<code>grantKey</code> 稳定且忽略 description、问题文案、settings 的 shell 转义、钩子三种事件对假守护进程的输出</td></tr>
+<tr><td><code>stop.test.ts</code></td><td>重启时停旧守护进程：有 <code>/shutdown</code> 的正常退出；没有的（早期构建）按 pid 发 SIGTERM；杀不掉的如实报失败</td></tr>
+</table>
+<p>改 mod 后在 Router 会话里执行 <code>/reload-plugins</code> 即生效（插件直接从 <code>packages/router-mod</code> 读取）。改守护进程后 <code>pnpm build</code>，再在 Router 里 <code>/agentd restart</code>，或在任意终端于仓库根目录执行 <code>pnpm daemon:restart</code>，换成新版。两者逻辑相同，都不依赖旧进程有 <code>/shutdown</code>。守护进程独立于 Router 会话，关掉重开 Router（<code>code router</code>）不会换掉它。</p>
+
+<h3 id="privacy">5.1 公开仓库的隐私规则</h3>
+<p>规则写在 <a href="AGENTS.md">AGENTS.md</a>，<code>CLAUDE.md</code> 引用它，所以在本仓库里起的 Claude Code 会话（包括 agentd 派来的 Worker）都会读到。要点：不提交密钥、个人邮箱、本机绝对路径、内网主机、别的私有项目的任何信息；举例一律用占位（<code>acme</code>、<code>alice</code>、<code>example.com</code>、<code>~/code</code>）；开发笔记写进 <code>implementation-notes.md</code>，它不进版本库。</p>
+<p><b>机制</b>：<code>pnpm install</code> 的 <code>prepare</code> 把 <code>core.hooksPath</code> 指向 <code>.githooks/</code>，pre-commit 跑 <code>scripts/check-sensitive.mjs --staged</code>，读暂存区里的内容（不是工作区），命中就拒绝提交；commit-msg 用同一套规则查提交信息（提交信息同样会公开）。它查：</p>
+<ul>
+  <li>常见密钥格式（私钥块、<code>sk-</code>、<code>ghp_</code>、<code>glpat-</code>、AWS、JWT…）和「secret / token / password = 长字面量」；</li>
+  <li><code>/Users/&lt;名&gt;</code>、<code>/home/&lt;名&gt;</code>、<code>C:/Users/&lt;名&gt;</code>，单字母和 alice 这类占位名放行；</li>
+  <li>邮箱，只放行 example 域名和 GitHub / Anthropic 的 noreply；</li>
+  <li>git 远端主机，只放行 github.com、gitlab.com、bitbucket.org 和 example 域名；<code>*.ts.net</code>；私网 IP；</li>
+  <li>文件名：<code>.env*</code>（<code>.env.example</code> 除外）、密钥文件、数据库文件、<code>implementation-notes.md</code>；</li>
+  <li>提交人与作者的邮箱（<code>git var GIT_AUTHOR_IDENT</code>，环境变量覆盖也算）必须是 noreply 地址——它会随每个提交公开。</li>
+</ul>
+<p><b>微妙之处</b>：规则只能写成通用的，因为把「我的公司名、内网主机名」写进脚本本身就是泄露。这类词一行一个放在仓库根的 <code>.sensitive-words</code>（被 gitignore），脚本运行时读入（在 worktree 里提交时也读主目录那份，agentd 的 Worker 就是在 worktree 里提交的）、不分大小写匹配。真要放行的一行加 <code>sensitive-check: allow</code> 注释。测试里的样例用字符串拼接，免得测试文件自己触发检查。<code>pnpm-lock.yaml</code> 不扫。</p>
+
+<!-- ============================================================ -->
+<h2 id="ref">6. 参考</h2>
+
+<h3>6.1 配置 <code>~/.agentd/config.json</code></h3>
+<pre><code>{
+  "roots": ["~/code"],
+  "port": 7707,
+  "scanDepth": 3,
+  "worker": { "model": "opus", "permissionMode": "auto", "maxConcurrent": 4 },
+  "router": { "inlineChars": 300 },
+  "stallSeconds": 45,
+  "idleExitSeconds": 0,
+  "defaultDelivery": "local",
+  "projects": {
+    "~/code": { "delivery": "mr" },
+    "~/code/Acme/Legacy": { "delivery": "local" }
+  },
+  "githubOwners": ["kid551"]
+}</code></pre>
+<p><code>projects</code> 指定交付方式：<code>mr</code> 的项目里写入奏折各开 worktree、走 MR；<code>local</code> 的在主目录串行。key 可以是一个仓库，也可以是一个文件夹（下面所有仓库都算），可写 <code>~</code>；一个仓库被几个 key 覆盖时，离它最近的那个说了算，所以文件夹设成 mr、里面个别仓库再单独写成 local 即可。按整段路径比较：<code>…/acme</code> 不会覆盖 <code>…/acme-flutter</code>。没有任何 key 覆盖的仓库用 <code>defaultDelivery</code>（默认 <code>local</code>）。合并分支固定是 <code>main</code>：配成 mr 的仓库若没有 origin 或本地没有 <code>origin/main</code>，派工时自动按 local 处理（3.8），不必逐个写例外。</p>
+<p><code>githubOwners</code>：你能推送的 GitHub 账号或组织（不分大小写）。写了它，github.com 上 owner 不在名单里的仓库即使配成 mr 也按 local，免得在别人项目的克隆里开出推不上去的 MR；不写或写空数组则不限制。GitLab 等其他主机不受它影响。</p>
+<p>环境变量：<code>AGENTD_HOME</code> 改状态目录（默认 <code>~/.agentd</code>），<code>AGENTD_PORT</code> 改插件连接的端口，<code>AGENTD_ROUTER=1</code> 让任意目录成为 Router，<code>AGENTD_CLAUDE</code> 指定 claude 可执行文件。</p>
+
+<h3>6.2 HTTP API（127.0.0.1，无鉴权）</h3>
+<p>只绑本机回环地址，但本机任何进程都能派工、停工。单人机器上接受；共用机器需要再加 token。</p>
+<pre><code>GET  /status?script=路径          → { ok, lastEventId, isStale, … }  isStale：该文件与正在跑的构建内容不同（不带 script 时看自己的文件）
+POST /shutdown                   守护进程退出（插件 /agentd restart 用）
+GET  /projects                   POST /projects/rescan
+GET  /tickets?state=open|needs_me|recent|all
+POST /tickets                    { project, title, prompt, readonly?, model? }
+GET  /tickets/:id                GET  /tickets/:id/events?limit=   GET /tickets/:id/transcript?tail=
+GET  /activity                     （在干的奏折各自最后两行动作与时间）
+                                 limit / tail 只接受 1–500 的整数，否则用默认值
+POST /tickets/:id/report         { summary }                ← Worker
+POST /tickets/:id/ask            { question, options?, kind?, grantKey? }  ← Worker / 审批钩子，返回 questionId
+GET  /questions/:id?wait=秒       等待回答（≤30 秒一轮）→ { answered, answer, withdrawn }  ← Worker
+POST /tickets/:id/done           { outcome, summary }       ← Worker；outcome 多一个 merged（核对 origin 上分支已删）
+POST /tickets/:id/grants/take    { key } → { granted }      ← PreToolUse 钩子，消耗一次批准
+POST /tickets/:id/answer         { answer } → { hadWaiter, workerName }
+POST /tickets/:id/message        { text }   只记录并改状态；投递由插件先完成
+POST /tickets/:id/say            { text }   单聊里你亲手打的字：blocked/failed 奏折接着原会话重启，原文作为用户消息送进去
+POST /tickets/:id/open_mr        待审的 MR 奏折开 MR（先记下，插件再把指令送到 Worker）
+POST /tickets/:id/open_mr/undo   指令没送到：撤回开 MR，奏折回到待审（之后已有动静就拒绝）
+POST /tickets/:id/close          { discard? }  有 worktree 的奏折必须带 discard=true，会删 worktree 和分支
+POST /tickets/:id/stop | retry | resume
+                                          retry：有 Worker 会话的 blocked/failed 奏折接着原会话重启
+                                          resume：stopped 的奏折接着原会话恢复，先自查再问
+GET  /events?since=游标&amp;wait=秒</code></pre>
+
+<h3>6.3 状态文件</h3>
+<table>
+<tr><td><code>~/.agentd/agentd.db</code></td><td>SQLite（WAL）：projects、tickets、events、questions</td></tr>
+<tr><td><code>~/.agentd/mcp/&lt;id&gt;.json</code></td><td>每张奏折的 Worker MCP 配置</td></tr>
+<tr><td><code>~/.agentd/mcp/&lt;id&gt;.grant</code></td><td>存在＝该奏折有待用的批准，PreToolUse 钩子才去问守护进程</td></tr>
+<tr><td><code>~/.agentd/logs/daemon.log</code></td><td>守护进程日志</td></tr>
+</table>
+
+<h3>6.4 分享给别人</h3>
+<p>本仓库本身就是插件市场 <code>TerenceXie-agentd</code>（<code>.claude-plugin/marketplace.json</code>），别人不用 clone、不用 build。</p>
+<p><b>对方需要：</b>Node ≥ 24（守护进程用 <code>node</code> 跑）；<code>claude</code> 在 PATH 上（守护进程用它起 Worker）；能读这个 GitHub 仓库（私有仓库要有不弹密码的 SSH key，或者 <code>gh auth login</code> 后 <code>gh auth setup-git</code>）。macOS 以外未验证：「打开」按钮用的 <code>open -a</code> 是 macOS 专用。</p>
+<p><b>安装</b>（终端里，VSCode 插件版与终端版共用这套配置）：</p>
+<pre><code>claude plugin marketplace add kid551/agentd
+mkdir -p ~/agentd-router &amp;&amp; cd ~/agentd-router &amp;&amp; touch .agentd-router
+claude plugin install agentd-router@TerenceXie-agentd --scope project
+code ~/agentd-router      # 在这个窗口里开 Claude Code，第一次的信任提示选「是」</code></pre>
+<p><b>自动更新</b>：第三方市场默认不自动更新，<code>marketplace.json</code> 也没有字段能替用户打开。每人一次：终端里 <code>claude</code> → <code>/plugin</code> → Marketplaces → <code>TerenceXie-agentd</code> → Enable auto-update。之后每次会话启动在后台检查新提交，下次会话生效。不开的话手动 <code>claude plugin update agentd-router@TerenceXie-agentd</code>。插件更新后守护进程还是旧的，Router 会提示 <code>/agentd restart</code>（见第 4 节「守护进程会过期」）。</p>
+<p><b>发版</b>：改代码 → <code>pnpm check</code>（最后一步 build 会把产物复制进 <code>packages/router-mod/daemon/</code>）→ 连同 <code>daemon/</code> 一起提交 → push main。三件事让它成立：</p>
+<ul>
+  <li><b><code>daemon/</code> 进版本库。</b>别人装插件时 Claude Code 只 clone 和复制，不会替他们 build。</li>
+  <li><b><code>plugin.json</code> 不写 <code>version</code>。</b>用户只有在插件版本变了才拿新副本；不写版本就按提交 SHA 算，每次 push 都是新版本。写了 <code>0.1.0</code> 又不改，用户永远停在旧缓存上。<code>claude plugin validate</code> 会为此报一条警告，是有意的。</li>
+  <li><b>过期检测比内容。</b>见第 4 节。</li>
+</ul>
+<p><b>对方访问不了 GitHub（或用 Windows）</b>：<code>pnpm pack:share</code> 在 <code>output/</code>（已加入 git 忽略）生成两个文件，一起发过去即可：</p>
+<ul>
+  <li><code>agentd-router.zip</code>：<code>git archive HEAD .claude-plugin packages/router-mod</code>，只打包这两处已提交的文件，所以不会带上未提交的改动、<code>.git</code>、<code>node_modules</code>、<code>~/.agentd</code>，也不会带上仓库里的其他文档。这两处如果有未提交的改动，脚本会拒绝打包，避免刚 build 完的 <code>daemon/</code> 还没提交、包里装的却是旧版本。</li>
+  <li><code>agentd-router-install.html</code>：从 <code>scripts/share/</code> 复制过来（源文件进版本库），是写给对方 Claude Code 执行的安装规程，Windows 专用：每一步都写明命令、成功标志、失败时怎么办，并标出要问用户、要用户亲手做的步骤。对方把两个文件放在一起，让 Claude「按这份 HTML 安装」即可。对方会用本地目录作为 marketplace 来源（<code>claude plugin marketplace add &lt;解压目录&gt;</code>）。这种来源没有提交 SHA，插件版本显示为 <code>unknown</code>；升级时覆盖解压目录，再运行 <code>marketplace update</code> 和 <code>plugin update</code>，就会从源目录刷新（已在 macOS 上验证）。</li>
+  <li>Windows 上已知的缺口写在规程第 6 节：「打开」按钮依赖 iTerm2 和 <code>open -a</code>，在 Windows 上不可用；守护进程用 <code>execFile('claude')</code> 起 Worker，要求找到的第一个 <code>claude</code> 是 <code>claude.exe</code>，否则需要设置 <code>AGENTD_CLAUDE</code>；守护进程可能会单独开一个控制台窗口。</li>
+</ul>
+<p><b>告诉使用者的三件事：</b></p>
+<ul>
+  <li><b>标记文件放在专用空目录，别放进代码仓库。</b>Router 会话禁用 Bash / Read / Edit / Write 等工具，仓库里放了标记就在那里读不了也改不了代码；提交进去还会让同事的会话也变成 Router。</li>
+  <li><b>别把 <code>AGENTD_ROUTER=1</code> 设成全局环境变量</b>，否则每个会话都是 Router。</li>
+  <li><b>一次只开一个 Router 窗口。</b>守护进程全机一个（7707 端口、<code>~/.agentd</code>），所有 Router 共用同一批奏折，没有互斥：两个 Router 会收到同样的问题与交付，都可能去回 Worker。</li>
+</ul>
+<p>在普通目录里插件几乎不做事：工具和斜杠命令只在 Router 会话注册，其余钩子见 <code>kit</code> 为空即放行，也不会拉起守护进程。只装在 Router 目录（<code>--scope project</code>）时，别的会话根本不加载它。</p>
+
+<!-- ============================================================ -->
+<h2 id="dsh">7. DeepSeek Harness 版（dsh-superagent）</h2>
+<p>同一套 Super-agent 的第二个宿主：<code>packages/dsh-superagent</code> 是 DeepSeek Harness（dsh）桌面应用的 profile 插件。Router 和 Worker 都是 dsh 的原生会话，不需要守护进程、MCP 和 CLI 对账。方案与已定决策见 <a href="DSH-PLAN.html">DSH-PLAN.html</a>，验证结论与偏差见 <code>implementation-notes.md</code> 的「dsh-superagent」一节。</p>
+
+<h3>7.1 安装与使用</h3>
+<pre><code>pnpm install
+pnpm --filter dsh-superagent build
+pnpm --filter dsh-superagent install:dsh     # 复制到 ~/.dsh/profiles/desktop/plugins/，并在 cordis.patch.yml 里加一段
+# 卸载：pnpm --filter dsh-superagent uninstall:dsh</code></pre>
+<p>dsh 监听 <code>cordis.patch.yml</code>，改动后自动重组，一般不用重启；浏览器侧在下次刷新页面时加载。装好后：</p>
+<ol>
+  <li>左侧栏出现「Super-agent 奏折」面板。点「打开 Router」进入 Router 会话（放在 <code>~/.dsh/superagent/router</code> 工作区）。</li>
+  <li>对 Router 说要做什么。Router 调 <code>superagent_dispatch</code> 在对应项目里开一个 Worker 会话，Worker 出现在侧栏该项目下，行首有 <code>#号</code> 徽标。</li>
+  <li>Worker 的提问、审批画在它自己的会话里。Router 会转述并让你去「单聊」：在面板点「单聊」或 band 上的「下一张」，直接在 Worker 会话里回答。你在 Worker 会话里说的话，Router 会以旁注的形式知道。</li>
+  <li>验收：对 Router 说「收了」，或在面板点「收」。</li>
+</ol>
+
+<h3>7.2 架构</h3>
+<table>
+<tr><th>文件</th><th>职责</th></tr>
+<tr><td><code>src/core/state.ts</code></td><td>奏折状态机，比 agentd 多一个 <code>interrupted</code>；没有问题表（问题由 dsh 管）</td></tr>
+<tr><td><code>src/core/text.ts</code></td><td>Router / Worker 提示词、批量事件、总览，全是纯函数</td></tr>
+<tr><td><code>src/host/board.ts</code> · <code>tables.ts</code></td><td>唯一写者：一条 promise 链串行所有读-判-写；存储是 dsh 的 storage-domain「superagent」（<code>~/.dsh/storages</code>）</td></tr>
+<tr><td><code>src/host/service.ts</code></td><td>业务：派工、同项目串行、并发上限、追加指令、停/收/重试/恢复、Worker 回调、程序层 watchdog、Router 批处理</td></tr>
+<tr><td><code>src/host/runtime.ts</code> · <code>dsh.ts</code></td><td>与 dsh 的边界：<code>WorkerRuntime</code>、<code>RouterLink</code> 两个接口，<code>dsh.ts</code> 用 sessionController / agents / workspaceRegistry 实现</td></tr>
+<tr><td><code>src/host/index.ts</code></td><td>Cordis 插件入口：在 <code>agent/created</code> 上按角色装工具和提示词，观察 <code>session/event</code>、<code>agent/status</code>，镜像提问与审批，挂 HTTP 路由，3 秒一次 watchdog</td></tr>
+<tr><td><code>src/host/tools.ts</code></td><td>Router 9 个工具、Worker 2 个工具（<code>superagent_report</code> / <code>superagent_done</code>），按 dsh <code>defineTool</code> 的产物形状手写</td></tr>
+<tr><td><code>src/client/*</code></td><td>浏览器侧：面板（<code>sidebar.panellist</code> + <code>main</code>）、会话行徽标与 hover（<code>sidebar.session.row.*</code>）、输入框上方的 band（<code>conversation.input.dock</code>）</td></tr>
+<tr><td><code>scripts/install.mjs</code></td><td>安装/卸载；在 patch 文件里维护带标记的一段（Router preset + 插件行），每次改动前备份</td></tr>
+</table>
+
+<h3>7.3 机制原理</h3>
+<ul>
+  <li><b>Router 不执行</b>：preset <code>superagent-router</code> 只有 persona、time-context、compaction，没有 shell / fs / web 工具；插件再给它装 9 个路由工具。不能靠 <code>tools.restrict</code>：它只遮全局工具，preset 的工具遮不掉。</li>
+  <li><b>Worker 是普通会话</b>：经 <code>sessionController.create</code> 创建，和你在界面里新建的会话一样归 controller 所有，插件重载不影响正在干的 Worker。会话 id 在创建前就写进奏折，<code>agent/created</code> 触发时就能认出它是哪张奏折。</li>
+  <li><b>批处理</b>：需要人处理的事件（提问、就绪、受阻、失败、卡住、中断、启动失败）入队；1.5 秒内没有新事件、且 Router 空闲时，合并成一条「[superagent] N 条新事件」用 <code>followup</code> 开一轮。Router 正在推理时不打断，等 <code>agent/status</code> 变 idle。</li>
+  <li><b>Inline &amp; Spill 与链式召回</b>：每条事件 ≤300 字，截断时注明；交回类事件附此前最后一条进展。<code>superagent_read</code> 三跳：summary → events → transcript。summary 和总览里的「最近消息」与 agentd 同一规则（Worker 或插件说的最后一句，等你处理的提问或审批也算，另含 interrupted；你在 Worker 会话里说的话不算），与「在等你」相同时不重复。</li>
+  <li><b>提问与审批只镜像</b>：在 Worker 的 <code>user-questions/request</code>、<code>approval/request</code> 上挂一个只观察的监听，奏折进 asking，<code>next()</code> 结算后回 working。Router 不能替你批准。</li>
+  <li><b>watchdog</b>：working 的 Worker 空闲超过 60 秒没调 done 记为卡住（受阻），附最后一个动作；插件启动时，working/asking 但会话已不在线的奏折记为中断。</li>
+</ul>
+
+<h3>7.4 微妙之处</h3>
+<ul>
+  <li><b>插件不 import dsh 的包</b>：profile 的模块兜底目录在本机指向旧的源码 checkout，import 进来会是另一份副本。所有 dsh 接口都按结构类型调用（<code>src/host/dsh.ts</code> 顶部）。</li>
+  <li><b>模型</b>：Router 和 Worker 都用你当前的默认模型（偏差 1）。按会话指定模型会把你的全局默认改掉，所以没做。</li>
+  <li><b>消息来源</b>：批量事件显示为「收到外部事件」（webhook 来源），Router 转给 Worker 的话显示为「收到任务消息」（agent-message 来源）。Worker 被要求不把后者当作权限批准。</li>
+  <li><b>收与停</b>：收只结束奏折、停掉正在跑的一轮，会话保留；停可以恢复，恢复时 Worker 先只读自查、汇报、提问。</li>
+  <li><b>只读奏折与 MR 奏折</b>：和 agentd 同一套（3.8），共用 <code>packages/agentd/src/lanes.ts</code> 与 <code>lane-rules.ts</code>。worktree 前缀是 <code>superagent</code>（<code>.claude/worktrees/superagent-&lt;id&gt;-&lt;戳&gt;</code>），和 agentd 的不会撞名。插件配置里 <code>projects: { "&lt;路径&gt;": { "delivery": "mr" } }</code> 指定 MR 项目。三点不同：派工时不做 3.8 的本地检查，也不认 <code>githubOwners</code>，规则 3 b 一律是 GitLab 版（偏差 P15）；只读奏折只有规则约束，并且照旧占用 local 项目（偏差 P2）；「放弃」二次确认在面板卡片上。</li>
+  <li><b>尚未在真 dsh 里跑过</b>：单元测试和接线测试用的是按安装版接口写的模拟 ctx。装上之后需要确认的点列在 implementation-notes 的 spike 结论里（S1、S3–S7）。</li>
+</ul>
+
+<h3>7.5 开发与测试</h3>
+<pre><code>pnpm --filter dsh-superagent typecheck
+pnpm test                       # 含 packages/dsh-superagent/tests
+pnpm --filter dsh-superagent build</code></pre>
+
+</body>
+</html>

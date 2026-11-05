@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>agentd 实施方案 · 本地 Super-agent 基础设施</title>
+<style>
+  :root { --fg:#1f2328; --muted:#656d76; --line:#d0d7de; --bg:#fff; --soft:#f6f8fa; --accent:#0969da; --warn:#9a6700; --warnbg:#fff8c5; --ok:#1a7f37; }
+  body { font: 15px/1.7 -apple-system, "PingFang SC", "Helvetica Neue", sans-serif; color:var(--fg); background:var(--bg); max-width: 980px; margin: 40px auto; padding: 0 24px; }
+  h1 { font-size: 26px; border-bottom: 1px solid var(--line); padding-bottom: 10px; }
+  h2 { font-size: 20px; margin-top: 48px; border-bottom: 1px solid var(--line); padding-bottom: 6px; }
+  h3 { font-size: 16px; margin-top: 28px; }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
+  code { background: var(--soft); padding: 1px 5px; border-radius: 4px; }
+  pre { background: var(--soft); padding: 12px 14px; border-radius: 6px; overflow-x: auto; line-height: 1.5; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; }
+  th, td { border: 1px solid var(--line); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--soft); }
+  .muted { color: var(--muted); }
+  .decision { border-left: 4px solid var(--accent); background: #f0f6ff; padding: 10px 14px; margin: 14px 0; }
+  .decision b:first-child { color: var(--accent); }
+  .verify { border-left: 4px solid var(--warn); background: var(--warnbg); padding: 10px 14px; margin: 14px 0; }
+  .ok { color: var(--ok); }
+  .toc { background: var(--soft); padding: 12px 20px; border-radius: 6px; }
+  .toc ol { margin: 6px 0; }
+  .tag { display:inline-block; font-size: 12px; padding: 0 6px; border-radius: 10px; background: var(--soft); border: 1px solid var(--line); color: var(--muted); margin-left: 6px; }
+</style>
+</head>
+<body>
+
+<h1>agentd 实施方案 <span class="muted" style="font-size:15px;">本地 Super-agent 基础设施 · 2026-11-03</span></h1>
+
+<p>按 DeepSeek《Super-agent 设计探索》的双层架构，在本仓库搭一套只服务于你一个人的 Router / Worker 系统：你只跟一个 Router 会话说话，它把活派给各项目目录下的 Worker 会话；Worker 会话在 VSCode 的 Claude Code 插件里原生可见；所有需要你拍板的问题汇总回 Router，并且随时清楚「我现在在批哪一个」。</p>
+
+<div class="toc">
+<b>目录</b>
+<ol>
+  <li><a href="#decisions">采访结论（已定）</a></li>
+  <li><a href="#arch">架构总览</a></li>
+  <li><a href="#model">数据模型 <span class="tag">最可能要调</span></a></li>
+  <li><a href="#ifaces">接口：HTTP / MCP 工具 / mod 工具 <span class="tag">最可能要调</span></a></li>
+  <li><a href="#ux">用户可见的交互 <span class="tag">最可能要调</span></a></li>
+  <li><a href="#context">Router 的上下文管理：PDF 机制 → 落地</a></li>
+  <li><a href="#spikes">第 0 步：必须先验证的 5 个点</a></li>
+  <li><a href="#steps">实施步骤与验收</a></li>
+  <li><a href="#layout">仓库布局与技术栈</a></li>
+  <li><a href="#notdo">明确不做的事 / 风险</a></li>
+</ol>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="decisions">1. 采访结论（已定）</h2>
+<table>
+<tr><th style="width:28%">问题</th><th>你的决定</th><th style="width:32%">对设计的影响</th></tr>
+<tr><td>唯一入口的形态</td><td>VSCode 里打开 agentd 工作区的一个 Claude Code 会话，就是 Router</td><td>不改插件；Router 的所有附加能力以 <b>mod</b> 形式注入该会话</td></tr>
+<tr><td>任务来源</td><td>v1 只有你在 Router 里说的话</td><td>不实现任何外部 Source；但数据模型保留 <code>source</code> 字段，v2 加 GitHub / 飞书时不用改表</td></tr>
+<tr><td>批阅方式</td><td>全部在 Router 里回答，带工单标头；要看细节再跳 Worker tab</td><td>需要 band（当前聚焦）+ Pane（工单列表）+ 问题注入 Router 的通道</td></tr>
+<tr><td>Worker 执行环境</td><td>默认直接在项目目录、当前分支；你说了才开 worktree</td><td>同一项目同时只允许 1 个 Worker（排队）；<code>worktree: true</code> 为派工选项</td></tr>
+<tr><td>Worker 权限</td><td><code>auto</code>（与你现有默认一致）</td><td>权限询问也作为一种「问题」投递到 Router</td></tr>
+<tr><td>项目范围</td><td>扫描固定根目录，按目录名匹配</td><td>agentd 启动时扫描配置的根目录下所有 git 仓库建注册表；歧义时 Router 问你一次</td></tr>
+<tr><td>模型</td><td>Router sonnet，Worker opus</td><td>Router 由你在 VSCode 里 <code>/model sonnet</code>；Worker 由 agentd 派工时 <code>--model opus</code>，可单次覆盖</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="arch">2. 架构总览</h2>
+
+<pre>
+ ┌──────────────── VSCode（agentd 工作区）─────────────────┐      ┌── VSCode（项目 X 工作区，可选）──┐
+ │  Router 会话（Claude Code，sonnet）                        │      │  会话列表里原生出现：               │
+ │   ├─ router-mod（本仓库 packages/router-mod）              │      │   agentd-w-12 · 修复滚动掉帧        │
+ │   │   ├─ Pane「工单」  ├─ band「正在批 #12 …」              │      │   （只读围观 / 必要时直接插话）     │
+ │   │   ├─ /next /focus  ├─ 工具 agentd_* ($.tool.register)   │      └──────────────────────────────────┘
+ │   │   └─ 拒绝 Edit/Write/Bash（Router 不干活）              │                      ▲ deeplink
+ │   └─ $.http.fetch ──────────────┐    $.session.send ────────┼──────────────────────┼─────────┐
+ └─────────────────────────────────┼───────────────────────────┘                      │         │
+                                   ▼                                                  │         ▼
+ ┌──────────── agentd 守护进程（Node 24，launchd 常驻，127.0.0.1:7707）──────────────┐ │  ┌───────────────────────┐
+ │  SQLite（node:sqlite）: projects / tickets / events / questions                     │ │  │ Worker 会话（opus）     │
+ │  HTTP API（Router mod 用） · 长轮询 /events                                         │ │  │ claude --bg -n agentd-w-12│
+ │  派工：spawn `claude --bg …` 于项目目录；轮询 `claude agents --json` 跟踪存活状态     │ │  │ cwd = 项目 X             │
+ │  项目注册表：扫描 roots 下的 git 仓库                                                │ │  │ --mcp-config agentd-mcp  │
+ └────────────────────────────────────────────▲───────────────────────────────────────┘ │  │ 工具 agentd_report/ask/… │
+                                              │ HTTP（本机）                             │  └───────────┬───────────┘
+                                   ┌──────────┴──────────┐                              │              │ stdio
+                                   │ agentd-mcp（stdio）  │◄─────────────────────────────┴──────────────┘
+                                   │ Worker 侧 MCP 工具   │
+                                   └─────────────────────┘
+</pre>
+
+<p>三个运行单元，各自职责一句话：</p>
+<ul>
+  <li><b>agentd（守护进程）</b>：事实源。存工单与事件、派 Worker、收 Worker 汇报、扫项目。无 LLM、无 UI。Router 不在线它照收。</li>
+  <li><b>router-mod</b>：Router 会话的「外挂」。把 agentd 的事件批量注入 Router，画 Pane 与 band，给 Router 提供 <code>agentd_*</code> 工具，禁掉 Router 的执行类工具，把你的回复直通给 Worker。</li>
+  <li><b>agentd-mcp</b>：Worker 会话里的 MCP server，三个工具：汇报、提问（阻塞等答复）、完工。只是 agentd HTTP 的薄壳。</li>
+</ul>
+
+<div class="decision"><b>决策 A · Worker 用 <code>claude --bg</code> 而不是 agentd 自己 spawn 子进程</b><br>
+理由：<code>--bg</code> 是 Claude Code 原生的后台会话机制，自带守护、<code>claude agents</code> 列表、<code>attach</code>、崩溃后 <code>respawn</code>；Worker 的生命不绑在 Router 或 VSCode 上，你关掉 VSCode 它继续干。transcript 写在目标项目的 <code>~/.claude/projects/&lt;项目&gt;/&lt;session-id&gt;.jsonl</code>，VSCode 的会话列表原生能看到。代价：Worker 的输出流不经过 agentd，agentd 对 Worker 的感知依赖它主动调 <code>agentd_report</code> 以及轮询 <code>claude agents --json</code> 的 busy/idle/exited 状态。</div>
+
+<div class="decision"><b>决策 B · 问题答复走「阻塞式工具」，追加指令走原生会话消息</b><br>
+Worker 问问题时调 <code>agentd_ask</code>，这个 MCP 工具会长轮询 agentd 直到你的答复到达才返回，Worker 这一轮一直挂着，跟原生 AskUserQuestion 的体验完全一致，并且在 Worker 的 VSCode tab 里能看到它正在等什么。答复的投递因此不依赖 Router 在线，未来 IM / CLI 也能答。<br>
+你要给一个<b>空闲</b> Worker 追加新指令时（没有待答问题），Router mod 用引擎原生的 <code>$.session.send({ to: "agentd-w-12" })</code>，即 SendMessage 的底层。</div>
+
+<!-- ============================================================ -->
+<h2 id="model">3. 数据模型 <span class="tag">最可能要调</span></h2>
+
+<p>只有 4 张表，概念直接沿用 PDF / 参考仓库的词：Ticket（工单）、Event（事件）、Question（待人工决定，参考仓库叫 Attention）、Project（注册表）。v1 不做 Thread / Source / Mandate 这些实体，只留字段位。</p>
+
+<h3>Ticket · 工单</h3>
+<pre><code>id          INTEGER PK          -- 短号，#12 就是它，所有界面只用这个
+title       TEXT                -- Router 起的一句话标题（≤ 30 字）
+project_id  TEXT → projects.id
+prompt      TEXT                -- 派给 Worker 的完整任务描述
+state       TEXT                -- 见下表
+worker_session_id  TEXT         -- 预生成的 UUID，用于 deeplink 和 jsonl 定位
+worker_name        TEXT         -- agentd-w-&lt;id&gt;，$.session.send 的地址
+worker_bg_id       TEXT         -- claude --bg 打印的短 id，用于 stop / logs / respawn
+worktree    INTEGER             -- 0/1
+model       TEXT                -- 默认 opus
+source      TEXT                -- v1 恒为 'router'；v2: github / feishu
+last_report TEXT                -- 最近一次 Worker 摘要（Inline 用，≤ 300 字）
+created_at / updated_at / ended_at</code></pre>
+
+<table>
+<tr><th>state</th><th>含义</th><th>谁能把它变成这样</th><th>Pane 分组</th></tr>
+<tr><td><code>queued</code></td><td>同项目有别的 Worker 在跑，排队</td><td>agentd</td><td>进行中</td></tr>
+<tr><td><code>working</code></td><td>Worker 在干</td><td>agentd（spawn 成功 / 收到 progress 汇报）</td><td>进行中</td></tr>
+<tr><td><code>asking</code></td><td>有未答的 Question</td><td>Worker 调 <code>agentd_ask</code></td><td><b>待我处理</b></td></tr>
+<tr><td><code>ready</code></td><td>Worker 说可以验收了</td><td>Worker 调 <code>agentd_done(outcome=ready)</code></td><td><b>待我处理</b></td></tr>
+<tr><td><code>blocked</code> / <code>failed</code></td><td>Worker 卡住 / 进程异常退出</td><td>Worker 汇报，或 agentd 轮询发现进程没了且无 done</td><td><b>待我处理</b></td></tr>
+<tr><td><code>done</code></td><td>你验收通过或 Worker 说无事可做</td><td>你（Router 工具 <code>agentd_close</code>）或 Worker <code>outcome=dropped</code></td><td>已结束</td></tr>
+<tr><td><code>stopped</code></td><td>你叫停</td><td>你</td><td>已结束</td></tr>
+</table>
+<p class="muted">规则：<code>ready</code> 之后你说「继续改 X」，工单回到 <code>working</code>（同一个 Worker 会话，<code>$.session.send</code> 唤醒）；不会新开工单。</p>
+
+<h3>Event · 事件（append-only，链式召回的材料）</h3>
+<pre><code>id, ticket_id, ts, kind, actor, body(JSON)
+kind ∈ dispatched | spawned | progress | ask | answer | message_to_worker | ready | blocked | failed | done | stopped | worker_exited
+actor ∈ you | router | worker | agentd</code></pre>
+
+<h3>Question · 待人工决定</h3>
+<pre><code>id, ticket_id, asked_at, question TEXT, options JSON(可空), answered_at, answer TEXT
+-- 一个工单同一时刻最多一个未答 Question（Worker 阻塞在 agentd_ask 上，天然保证）</code></pre>
+
+<h3>Project · 项目注册表</h3>
+<pre><code>id (目录名，重名时加父目录), path, root, default_branch, last_seen_at
+-- 启动时及每 10 分钟扫一次 config.roots，maxdepth 3 找 .git</code></pre>
+
+<h3>配置 <code>~/.agentd/config.json</code></h3>
+<pre><code>{
+  "roots": ["~/code"],
+  "port": 7707,
+  "worker": { "model": "opus", "permissionMode": "auto", "maxConcurrent": 4 },
+  "router": { "inlineChars": 300, "batchIdleMs": 1500 }
+}</code></pre>
+<p class="muted">数据库在 <code>~/.agentd/agentd.db</code>，日志在 <code>~/.agentd/logs/</code>。仓库本身不存运行状态。</p>
+
+<!-- ============================================================ -->
+<h2 id="ifaces">4. 接口 <span class="tag">最可能要调</span></h2>
+
+<h3>4.1 Worker 侧 MCP 工具（agentd-mcp，Worker 唯一的汇报通道）</h3>
+<table>
+<tr><th>工具</th><th>参数</th><th>行为</th></tr>
+<tr><td><code>agentd_report</code></td><td><code>{ summary }</code></td><td>记一条 progress 事件，刷新 <code>last_report</code>。非阻塞。Worker 系统提示要求它在每个阶段性节点调一次（≤ 300 字）。</td></tr>
+<tr><td><code>agentd_ask</code></td><td><code>{ question, options?: string[] }</code></td><td>建 Question，工单→<code>asking</code>，<b>长轮询直到有答复才返回</b>（期间每 20s 发 MCP progress 通知保活）。返回 <code>{ answer }</code>。</td></tr>
+<tr><td><code>agentd_done</code></td><td><code>{ outcome: ready | blocked | failed | dropped, summary }</code></td><td>工单进入对应状态。<code>ready</code> 的 summary 要写清「改了什么、怎么验证、你需要看哪里」。</td></tr>
+</table>
+<p>工具通过环境变量 <code>AGENTD_TICKET</code>、<code>AGENTD_URL</code> 知道自己是谁；Worker 不可能冒充别的工单。</p>
+
+<h3>4.2 Router 侧工具（router-mod 用 <code>$.tool.register</code> 注册，Router 模型调用）</h3>
+<table>
+<tr><th>工具</th><th>参数</th><th>行为</th></tr>
+<tr><td><code>agentd_dispatch</code></td><td><code>{ project, title, prompt, worktree?, model? }</code></td><td>解析项目名（唯一匹配才通过，否则返回候选让 Router 问你），POST /tickets，返回 <code>#id</code>。</td></tr>
+<tr><td><code>agentd_status</code></td><td><code>{}</code></td><td>一屏总览：待处理 / 进行中 / 24h 内结束，每行一句。</td></tr>
+<tr><td><code>agentd_read</code></td><td><code>{ ticket, what: summary | events | transcript, limit? }</code></td><td>链式召回的「下一跳」：summary 给工单全文 + 最近汇报；events 给事件流；transcript 给 Worker jsonl 的最后 N 条（从 <code>~/.claude/projects</code> 直接读）。</td></tr>
+<tr><td><code>agentd_answer</code></td><td><code>{ ticket, answer }</code></td><td>回答该工单的待答 Question（agentd 收到后 <code>agentd_ask</code> 的长轮询返回）。</td></tr>
+<tr><td><code>agentd_message</code></td><td><code>{ ticket, text }</code></td><td>给无待答问题的 Worker 追加指令：记事件 + <code>$.session.send({ to: worker_name, text })</code>。</td></tr>
+<tr><td><code>agentd_close</code> / <code>agentd_stop</code></td><td><code>{ ticket }</code></td><td>验收关闭 / 叫停（<code>claude stop &lt;bg_id&gt;</code>）。</td></tr>
+</table>
+
+<h3>4.3 agentd HTTP API（127.0.0.1 only，无鉴权；给 mod 和 mcp 用）</h3>
+<pre><code>GET  /status
+GET  /projects
+GET  /tickets?state=open|needs_me|all
+GET  /tickets/:id            GET /tickets/:id/events     GET /tickets/:id/transcript?tail=N
+POST /tickets                { project, title, prompt, worktree?, model? }
+POST /tickets/:id/report     { summary }                           ← mcp
+POST /tickets/:id/ask        { question, options? }  → 长轮询        ← mcp
+POST /tickets/:id/done       { outcome, summary }                   ← mcp
+POST /tickets/:id/answer     { answer }
+POST /tickets/:id/message    { text }        -- 只记事件；实际投递由 mod 的 $.session.send 完成
+POST /tickets/:id/stop  /close
+GET  /events?since=&lt;cursor&gt;&amp;wait=25   -- 长轮询，mod 的事件源</code></pre>
+
+<h3>4.4 派工命令（agentd 内部，供核对）</h3>
+<pre><code>cd &lt;project.path&gt; &amp;&amp; claude --bg \
+  -n agentd-w-&lt;id&gt; --session-id &lt;uuid&gt; --model opus --permission-mode auto \
+  --mcp-config ~/.agentd/mcp/&lt;id&gt;.json \          # 含 AGENTD_TICKET / AGENTD_URL 的 agentd-mcp 配置
+  --append-system-prompt-file &lt;packages/agentd/prompts/worker.md&gt; \
+  [--worktree agentd-&lt;id&gt;] \
+  "&lt;prompt&gt;"</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="ux">5. 用户可见的交互 <span class="tag">最可能要调</span></h2>
+
+<h3>5.1 一天的样子</h3>
+<ol>
+  <li>你在 agentd 工作区打开 Claude Code，会话加载 router-mod。右侧 Pane「工单」出现，空的。</li>
+  <li>你说：「在 acme-flutter 里把列表滚动掉帧修了，先别动数据层。」Router 调 <code>agentd_dispatch</code>，回你一句「<b>#12</b> acme-flutter · 修复列表滚动掉帧 · 已派」。Pane 多一行。</li>
+  <li>你接着派 #13、#14。三个 Worker 并行干。Router 安静。</li>
+  <li>#12 的 Worker 调 <code>agentd_ask</code>：「掉帧根因是 ListView 没加 itemExtent，加上会固定行高；行高固定可接受吗？」<br>
+      mod 收到事件，等 Router 这一轮结束后注入一条：<br>
+      <code>【#12 · acme-flutter · 修复列表滚动掉帧】问：… 选项：A 固定行高 / B 用 prototypeItem</code><br>
+      Router 转述给你（≤ 100 词），band 自动变成「<b>正在批 #12</b> · acme-flutter · 修复列表滚动掉帧 · 直通 Worker」。</li>
+  <li>你直接打「A，但 prototypeItem 也写个 TODO」。因为 #12 有待答问题且被聚焦，<b>mod 直通</b>：你的话不经 Router 模型，直接 POST answer，Worker 的 <code>agentd_ask</code> 返回继续干。Router 的 transcript 里只留一行「→ #12 已答」。</li>
+  <li>#13 和 #14 几乎同时 <code>done(ready)</code>。mod 合并成一条注入，Router 说「#13、#14 已就绪待验收」，Pane 的「待我处理」里两行，各有 [在 VSCode 打开] 按钮。你点开 #13 的 Worker tab 看 diff，满意，回 Router 说「13 收了」→ <code>agentd_close</code>。</li>
+  <li>晚上关 VSCode，#14 还有个 Worker 在跑测试。第二天打开 Router，mod 的 <code>session.start</code> 钩子注入 <code>agentd_status</code> 快照，Router 开口第一句就是总览。</li>
+</ol>
+
+<h3>5.2 band（输入框上方常显一行）</h3>
+<pre>
+聚焦有待答问题：   ▶ 正在批 #12 · acme-flutter · 修复列表滚动掉帧 · 你的话直通 Worker   (/r 改为对 Router 说)
+聚焦但无待答问题： ▶ 关注 #12 · acme-flutter · 修复列表滚动掉帧 · 你的话经 Router 转给 Worker
+无聚焦：           ○ 未聚焦工单 · 待处理 2 · 进行中 3     (/next 跳到下一个待处理)
+</pre>
+
+<div class="decision"><b>决策 C · 直通（Fast Path）的边界</b><br>
+聚焦工单有未答 Question 时，你的输入<b>默认直通</b> Worker，不消耗 Router 一轮，这是 PDF「已订阅走直通」在个人场景的对应。例外：以 <code>/</code> 开头的命令；以 <code>/r </code> 开头的话发给 Router。无未答 Question 时一律先到 Router，由它决定是追加指令（<code>agentd_message</code>）还是新派工单。如果你觉得直通太「硬」，改成「全部经 Router」只是关一个开关。</div>
+
+<h3>5.3 Pane「工单」</h3>
+<pre>
+待我处理 (2)
+  #12  acme-flutter   修复列表滚动掉帧          问 · 3 分钟前    [聚焦] [打开]
+  #13  billboard          接入新榜单 API             就绪 · 刚刚      [聚焦] [打开] [收]
+进行中 (1)
+  #14  acme-compute   补 ETL 单测                干 · 12 分钟      [打开] [停]
+已结束 · 今天 (3)  ▸
+</pre>
+<p>按钮行为：[聚焦] 改 band 焦点；[打开] <code>open vscode://anthropic.claude-code/open?session=&lt;worker_session_id&gt;</code>；[收] / [停] 调对应工具。所有文字中文，不出现 UUID。</p>
+
+<h3>5.4 slash 命令</h3>
+<table>
+<tr><td><code>/next</code></td><td>聚焦到最早的待处理工单，并把它的问题/就绪摘要再贴一次</td></tr>
+<tr><td><code>/focus 12</code> · <code>/unfocus</code></td><td>手动切换焦点</td></tr>
+<tr><td><code>/tickets</code></td><td>在聊天里打印一份与 Pane 相同的总览（没有 Pane 的 surface 用）</td></tr>
+<tr><td><code>/r &lt;话&gt;</code></td><td>直通状态下强制对 Router 说</td></tr>
+</table>
+
+<h3>5.5 Router 的说话风格（prompt.compose 注入）</h3>
+<ul>
+  <li>只做三件事：派工、转述 Worker 的问题与结果、把你的回答路由出去。不读代码、不改文件、不跑命令。</li>
+  <li>每次回复 ≤ 100 词，永远以 <code>#工单号</code> 开头指明在说哪个工单；一次只问一个问题。</li>
+  <li>派工前若项目名多义或任务范围不明，问一次；不自作主张扩大范围。</li>
+  <li>要细节先调 <code>agentd_read</code>，不要凭记忆。</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="context">6. Router 的上下文管理：PDF 机制 → 落地</h2>
+<table>
+<tr><th style="width:22%">PDF</th><th>落地</th><th style="width:26%">依赖的引擎能力（已在类型文件确认）</th></tr>
+<tr><td>Router 不执行、只路由</td><td><code>tool.call</code> 钩子在 Router 会话拒绝 Edit / Write / Bash / NotebookEdit / Agent，返回提示「派给 Worker」。Read / Grep / agentd_* 放行。</td><td><code>on('tool.call', …) → { deny }</code></td></tr>
+<tr><td>Batching</td><td>mod 长轮询 <code>/events</code>；事件先进内存队列；<code>turn.start</code> / <code>turn.complete</code> 跟踪 Router 是否在推理；空闲 1.5s 后把队列合并成<b>一条</b>注入。推理中到达的事件等这轮结束。</td><td><code>$.prompt.submit({ text })</code>、<code>turn.start</code>、<code>turn.complete</code></td></tr>
+<tr><td>Inline &amp; Spill</td><td>注入文本每工单只带：#id、项目、标题、事件类型、≤ 300 字摘要。全文留库。</td><td>—（agentd 侧截断）</td></tr>
+<tr><td>链式召回</td><td><code>agentd_read(ticket, what)</code> 三跳：summary → events → transcript。每跳结果内联下一跳的 ID。</td><td><code>$.tool.register</code>、<code>$.fs.read</code>（读 jsonl）</td></tr>
+<tr><td>Router 的长程记忆</td><td>事实源在 SQLite，不在 transcript。<code>session.start</code> 注入状态快照；<code>session.compact</code> 钩子在 compact 指令里追加「保留工单表与焦点」。</td><td><code>session.start</code>、<code>session.compact</code></td></tr>
+<tr><td>订阅直通</td><td>决策 C：聚焦工单有待答问题时，<code>prompt.submit</code> 钩子截获你的输入直接 POST answer，返回 <code>{ consumed }</code> 不进模型。</td><td><code>on('prompt.submit', …)</code> 可消费</td></tr>
+<tr><td>Worker 不直接对人说话</td><td>Worker 的系统提示：对外只通过三个 agentd 工具；不用 AskUserQuestion（Router 会话收不到）。</td><td>worker.md</td></tr>
+<tr><td>异步 ReAct</td><td>Worker 侧沿用 Claude Code 自身的后台任务机制，不另做。</td><td>—</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="spikes">7. 第 0 步：必须先验证的 5 个点</h2>
+<p>这些是方案成立的前提，每个都是半小时内能做完的实验，任何一个不成立都有写好的退路。实施从这里开始，验证结果记进 <code>implementation-notes.md</code>。</p>
+
+<div class="verify"><b>S1 · <code>claude --bg</code> 的参数组合与可见性</b><br>
+在一个真实项目目录跑 <code>claude --bg -n agentd-w-0 --session-id &lt;uuid&gt; --model sonnet --permission-mode auto --mcp-config x.json --append-system-prompt "…" "列出当前目录三个文件后结束"</code>。验证：① 进程起来且 <code>claude agents --json</code> 能看到名字与状态；② jsonl 出现在该项目的 projects 目录；③ 打开该项目的 VSCode 窗口，会话列表里出现；④ <code>open "vscode://anthropic.claude-code/open?session=&lt;uuid&gt;"</code> 能定位到它（在 agentd 窗口和项目窗口各试一次）。<br>
+<span class="muted">退路：④ 跨工作区不行 → Pane 的 [打开] 改为先 <code>open -a "Visual Studio Code" &lt;项目路径&gt;</code> 再 deeplink，或 Pane 内直接展示 transcript 尾部。</span></div>
+
+<div class="verify"><b>S2 · 空闲的 bg Worker 能被会话间消息唤醒</b><br>
+S1 的 Worker 结束一轮后空闲；从另一个会话 SendMessage 给 <code>agentd-w-0</code>「再列两个文件」。验证它醒来干活。<br>
+<span class="muted">退路：不行 → <code>agentd_message</code> 改为 <code>claude stop</code> 后 <code>claude --bg --resume &lt;uuid&gt; "&lt;text&gt;"</code>（help 里写明支持 --resume 的后台续跑）。</span></div>
+
+<div class="verify"><b>S3 · 阻塞式 MCP 工具能挂 &gt; 10 分钟</b><br>
+agentd-mcp 的 <code>agentd_ask</code> 原型：每 20s 发一次 progress 通知，15 分钟后返回。验证 Claude Code 不超时杀掉。<br>
+<span class="muted">退路：超时 → <code>agentd_ask</code> 改为非阻塞「已记录，结束本轮」，答复改由 S2 的通道投递；若 S2 也不行，用退路 resume。</span></div>
+
+<div class="verify"><b>S4 · router-mod 能在 VSCode 的会话里加载并画出 Pane / band</b><br>
+最小 mod：session.start 时 <code>$.ui.open</code> 一个 Pane 写「hello」，AbovePrompt 画一行。加载方式二选一验证：agentd 仓库 <code>.vscode/settings.json</code> 的 <code>claudeCode.environmentVariables</code> 设 <code>CLAUDE_CODE_PLUGIN_DIRS</code>；或 <code>.claude/settings.json</code> 的 <code>enabledPlugins</code> 指向本地 marketplace。<br>
+<span class="muted">退路：VSCode surface 不画 Pane → band + <code>/tickets</code> 命令兜底，Pane 只在终端用。</span></div>
+
+<div class="verify"><b>S5 · <code>$.prompt.submit</code> 从时钟钩子注入能成为一轮用户消息，且 <code>prompt.submit</code> 钩子能消费掉你的输入</b><br>
+mod 用 <code>$.clock.after(5000)</code> 注入一句话，看 Router 是否响应；再写一个 <code>prompt.submit</code> 钩子对以 <code>!</code> 开头的输入返回 consumed，看模型是否确实没收到。<br>
+<span class="muted">退路：注入不行 → 退化为 band 提示「有 2 条新事件，/next 查看」，由你触发。</span></div>
+
+<!-- ============================================================ -->
+<h2 id="steps">8. 实施步骤与验收</h2>
+<p>每步都有可独立验证的产物；每步结束跑 <code>pnpm check</code>（typecheck + vitest + build）。提交前向你确认，不自行 commit，不开分支。</p>
+
+<table>
+<tr><th style="width:5%">#</th><th style="width:40%">步骤</th><th>验收</th></tr>
+<tr><td>0</td><td>五个 spike（第 7 节），结论写进 <code>implementation-notes.md</code></td><td>五条各有「成立 / 走退路 X」结论</td></tr>
+<tr><td>1</td><td>mono-repo 骨架：pnpm workspace、TypeScript、eslint、prettier（无分号）、vitest、tsdown</td><td><code>pnpm check</code> 在空包上通过</td></tr>
+<tr><td>2</td><td><code>packages/agentd</code>：配置加载、SQLite schema 与迁移、项目扫描、Ticket 状态机（纯函数）</td><td>单测：状态迁移表穷举；扫描 roots 得到 ≥ 1 个项目；重名目录得到带父目录的 id</td></tr>
+<tr><td>3</td><td>HTTP API（node:http，不引框架）：全部路由 + <code>/events</code> 长轮询 + <code>/ask</code> 长轮询</td><td>集成测试：起服务，走完 dispatch → ask → answer → done 全流程（spawn 用假命令）</td></tr>
+<tr><td>4</td><td>派工：生成 mcp 配置文件、拼 <code>claude --bg</code> 命令、记录 bg_id、轮询 <code>claude agents --json</code> 同步 working/exited；同项目排队；<code>maxConcurrent</code></td><td>真派一个「列文件」Worker，工单走到 ready；手动 kill 进程，工单走到 failed</td></tr>
+<tr><td>5</td><td><code>packages/agentd-mcp</code>：三个工具，stdio，保活</td><td>用 MCP inspector 或单测验证三个工具；S3 的保活行为</td></tr>
+<tr><td>6</td><td><code>prompts/worker.md</code>：Worker 系统提示（只用三个工具对外、何时 report、ready 的 summary 模板、不要 AskUserQuestion、不 push 不开分支除非工单说）</td><td>真派一个需要提问的任务，Worker 确实调 <code>agentd_ask</code> 而非 AskUserQuestion</td></tr>
+<tr><td>7</td><td><code>packages/router-mod</code> 第一层：事件长轮询 + Batching 注入 + <code>session.start</code> 快照 + <code>agentd_*</code> 工具注册 + 拒绝执行类工具 + <code>prompt.compose</code> 注入 Router 角色</td><td><code>claude plugin validate</code> 与 <code>claude plugin test</code> 通过；在 Router 里口头派工成功；Worker 提问 → Router 转述</td></tr>
+<tr><td>8</td><td>router-mod 第二层：band、焦点状态（<code>$.state</code>）、直通、<code>/next /focus /tickets /r</code></td><td>决策 C 的三种 band 文案各出现一次；直通回答后 Worker 继续</td></tr>
+<tr><td>9</td><td>router-mod 第三层：Pane（分组、按钮、deeplink 打开）</td><td>Pane 在 VSCode 里渲染；[打开] 跳到 Worker tab</td></tr>
+<tr><td>10</td><td>守护进程自举：mod 在 <code>session.start</code> 探 <code>127.0.0.1:7707</code>，没响应就 <code>$.process.spawn(["node", "&lt;plugin&gt;/dist/agentd.mjs"])</code>。launchd plist + <code>scripts/install.sh</code> 作为 macOS 可选常驻方案。agentd 工作区的 <code>.vscode/settings.json</code> 与 <code>.claude/</code> 配置让 Router 会话自动带上 mod</td><td>杀掉守护进程后新开 Router 会话，<code>/status</code> 自动恢复响应；新开 Router 会话自动有 Pane</td></tr>
+<tr><td>11</td><td>端到端验收：按 5.1 的「一天」走一遍，三个并行 Worker</td><td>全程你只在 Router 里打字；每次都知道在批哪个</td></tr>
+<tr><td>12</td><td>README.html（架构、机制、微妙处、用法）；<code>implementation-notes.md</code> 偏差部分收尾；问你是否要理解测验报告</td><td>—</td></tr>
+</table>
+
+<p><b>关键路径上的串行等待</b>（按你的「等待要有理由」规则预先声明）：mod 的事件长轮询与 Router 推理并行；派工的 spawn 与数据库写入并行；唯一必须串行的是 <code>agentd_ask</code> 的等待本身，它等的就是你。</p>
+
+<!-- ============================================================ -->
+<h2 id="layout">9. 仓库布局与技术栈</h2>
+<pre><code>agentd/
+├── PLAN.html                      ← 本文件
+├── README.html                    ← 第 12 步产出
+├── implementation-notes.md        ← spike 结论与偏差记录
+├── package.json  pnpm-workspace.yaml  tsconfig.base.json  .eslintrc  .prettierrc(无分号)
+├── packages/
+│   ├── agentd/                    守护进程：config / db / projects / tickets / http / spawn / poll
+│   │   ├── src/  tests/  prompts/worker.md
+│   │   └── bin: agentd (serve | status | dispatch …，CLI 复用同一 HTTP API)
+│   ├── agentd-mcp/                Worker 侧 MCP server（@modelcontextprotocol/sdk，stdio）
+│   └── router-mod/                Claude Code mod
+│       ├── .claude-plugin/plugin.json
+│       ├── hooks/hooks.json  hooks/register.tsx
+│       ├── types/index.d.ts       ($.state 契约：焦点、队列游标)
+│       └── tests/*.test.tsx       (claude plugin test)
+├── launchd/dev.agentd.plist
+├── scripts/install.sh  scripts/uninstall.sh
+├── .vscode/settings.json          Router 会话加载 mod 的环境变量
+└── .claude/settings.json          Router 工作区的项目级设置</code></pre>
+
+<table>
+<tr><th>选择</th><th>理由</th></tr>
+<tr><td>Node 24 + TypeScript，pnpm workspace</td><td>你的 CLAUDE.md 要求；mod 本身只能是 TS/TSX</td></tr>
+<tr><td><code>node:sqlite</code>（Node 22.5+ 内置）</td><td>零原生依赖，launchd 下无需编译；单机单写者，不需要更重的库</td></tr>
+<tr><td>HTTP 用 <code>node:http</code>，不引框架</td><td>十几个路由，框架是负资产</td></tr>
+<tr><td>MCP 用官方 <code>@modelcontextprotocol/sdk</code></td><td>唯一的外部运行时依赖，保活用它的 progress 通知</td></tr>
+<tr><td>脚本名避开 pnpm 保留字</td><td><code>serve</code> / <code>check</code> / <code>fmt</code> / <code>lint</code> / <code>install:launchd</code>，见 pnpm-scripts-naming</td></tr>
+<tr><td>不用 Python</td><td>全栈 TS，省掉一套解释器约束</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="notdo">10. 明确不做的事 / 风险</h2>
+<ul>
+  <li><b>不改 VSCode 插件、不 patch Claude Code。</b>全部能力来自公开的 mod API、CLI 参数与 deeplink。版本升级若破坏某条，退路见第 7 节。</li>
+  <li><b>v1 不接任何外部 Source</b>（GitHub / 飞书 / 文件监听 / 定时）。表结构留 <code>source</code> 字段，v2 加一个 <code>packages/source-github</code> 往 <code>/tickets</code> POST 即可，Router / Worker 侧零改动。</li>
+  <li><b>不做 Watchdog Session。</b>v1 的「看门狗」只是 agentd 轮询进程存活 + 失败状态进「待我处理」。模型判断 Worker 是否偏航，留 v2。</li>
+  <li><b>不做 Router 水平切分、不做 Thread / Mandate 实体。</b>一个人的事件量到不了那个规模。</li>
+  <li><b>Worker 不开分支、不 push</b>，除非工单 prompt 明说。这是 worker.md 里的硬约束，与你的全局规则一致。</li>
+  <li><b>风险：Router 在 VSCode 里，VSCode 关了 Router 就不在</b>。Worker 和 agentd 不受影响，事件在库里攒着；这是你选的形态，可接受。若日后想要 Router 持久在线，把 Router 本身也用 <code>claude --bg</code> 起、VSCode 用 attach 连上去，mod 不用改。</li>
+  <li><b>风险：同一项目串行。</b>两个任务都要改 acme-flutter 时第二个排队。想并行就对第二个说「用 worktree」。</li>
+  <li><b>风险：Worker 不守规矩</b>（直接 AskUserQuestion 而不是 agentd_ask）。agentd 轮询到 Worker 长时间 idle 且无 ask/done 时，标为 <code>blocked</code> 并提示「Worker 可能在 tab 里等你」，Pane 的 [打开] 能救。</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="share">11. 分发给其他人（macOS / Windows）</h2>
+<p>三个运行单元里只有 mod 是「源码即产物」。整个仓库作为<b>一个 Claude Code plugin</b> 分发，plugin 内含 mod 源码 + 两个 build 好的单文件；对方只需要 Claude Code 和 Node 24，不需要 clone、pnpm。</p>
+<table>
+<tr><th>单元</th><th>对方机器需要</th><th>build</th></tr>
+<tr><td>router-mod</td><td>Claude Code（引擎自己编译 <code>register.tsx</code>；模块内不得 import npm 包）</td><td>无</td></tr>
+<tr><td>agentd 守护进程</td><td>Node 24</td><td>tsdown 打成 <code>dist/agentd.mjs</code> 单文件</td></tr>
+<tr><td>agentd-mcp</td><td>Node 24</td><td>tsdown 打成 <code>dist/agentd-mcp.mjs</code> 单文件</td></tr>
+</table>
+<ul>
+  <li><b>安装入口</b>：仓库根 <code>.claude-plugin/marketplace.json</code>；对方 <code>/plugin install agentd --marketplace TerenceXie/agentd</code>。试用可 <code>claude --plugin-url &lt;Release zip&gt;</code>。</li>
+  <li><b>产物位置</b>：<code>dist/</code> 不提交，<code>pnpm build</code> 后打 tag 发 GitHub Release zip。</li>
+  <li><b>守护进程自举</b>（第 10 步）：mod 起 <code>node &lt;plugin&gt;/dist/agentd.mjs</code>，Windows 无需 launchd / 任务计划。</li>
+  <li><b>个人配置</b>（<code>roots</code> 等）走 plugin <code>userConfig</code>，首次加载问一次。</li>
+  <li><b>Windows 差异</b>：deeplink 用 <code>cmd /c start</code> 代替 <code>open</code>，按 <code>process.platform</code> 分支；<code>claude --bg</code> 与 <code>~/.claude/projects</code> 路径转义在 Windows 上未验证，标为「仅 macOS 验证」。</li>
+</ul>
+
+<p class="muted" style="margin-top:48px;">下一步：你切到 opus 后说「按 PLAN.html 开始」，我从第 0 步的五个 spike 开始，结论逐条写进 implementation-notes.md，再进入第 1 步。</p>
+
+</body>
+</html>

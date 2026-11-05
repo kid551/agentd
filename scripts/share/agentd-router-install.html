@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agentd-router 安装规程（Windows，供 Claude Code 执行）</title>
+<style>
+  body { font: 15px/1.7 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; max-width: 900px; margin: 40px auto; padding: 0 20px; color: #222; }
+  h1 { font-size: 26px; margin-bottom: 4px; }
+  h2 { font-size: 20px; margin-top: 44px; border-bottom: 1px solid #ddd; padding-bottom: 6px; }
+  h3 { font-size: 16px; margin-top: 28px; }
+  code { font-family: Consolas, "Cascadia Mono", monospace; background: #f2f2f2; padding: 1px 5px; border-radius: 4px; }
+  pre { background: #1e1e1e; color: #e6e6e6; padding: 12px 16px; border-radius: 8px; overflow-x: auto; }
+  pre code { background: none; padding: 0; color: inherit; }
+  .box { padding: 10px 14px; border-radius: 4px; margin: 12px 0; }
+  .human { background: #e3f2fd; border-left: 4px solid #1e88e5; }
+  .ask { background: #fff8e1; border-left: 4px solid #f5b800; }
+  .user { background: #fce4ec; border-left: 4px solid #d81b60; }
+  .ok { background: #e8f5e9; border-left: 4px solid #43a047; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { border: 1px solid #ddd; padding: 6px 10px; text-align: left; vertical-align: top; }
+  th { background: #f6f6f6; }
+</style>
+</head>
+<body>
+
+<h1>agentd-router 安装规程</h1>
+<p>平台：Windows · 安装包：<code>agentd-router.zip</code>（与本文件放在同一个文件夹）</p>
+
+<div class="box human">
+<b>给人看的：怎么用这份文件</b>
+<ol>
+  <li>把 <code>agentd-router.zip</code> 和本文件放进同一个文件夹，比如「下载」。</li>
+  <li>在任意文件夹打开 Claude Code，对它说：<br>
+  <code>读一下 C:\Users\你的名字\Downloads\agentd-router-install.html，按里面的规程帮我安装 agentd-router</code></li>
+  <li>Claude 会一步步执行，途中会问你两三个问题。有几步只能你亲手做（重启 VS Code、点信任提示），Claude 会告诉你什么时候做。</li>
+</ol>
+这个插件目前只在 macOS 上测试过，Windows 上是第一次安装。遇到问题时，让 Claude 按第 6 节整理信息发回给作者。
+</div>
+
+<!-- ============================================================ -->
+<h2>0. 给 Claude：背景与执行规则</h2>
+
+<p><b>要装的是什么：</b>agentd-router 是一个 Claude Code 插件，以本地目录 marketplace 的形式分发。marketplace 名为 <code>TerenceXie-agentd</code>，插件名为 <code>agentd-router</code>。装好后，用户在一个专用文件夹里打开的 Claude Code 会话会变成 <b>Router</b>：用户用自然语言派活，插件通过本机的守护进程（Node 脚本，HTTP 监听 <code>127.0.0.1:7707</code>，数据放在 <code>~/.agentd</code>）为每个任务起一个后台 <code>claude --bg</code>（Worker），让它到对应的 git 仓库里工作。这个包不需要 build，zip 里已经带有构建好的 <code>.mjs</code>。</p>
+
+<p><b>执行规则：</b></p>
+<ol>
+  <li>按 1 → 5 的顺序执行。每一步跑完先看「成功标志」，满足了再进入下一步。不满足就按「失败时」处理；处理不了就停下来，把输出原样告诉用户。</li>
+  <li>标着 <span class="box ask" style="padding:1px 6px">问用户</span> 的地方必须先问用户、得到回答再继续，不要自己猜。</li>
+  <li>标着 <span class="box user" style="padding:1px 6px">用户操作</span> 的地方你做不了，比如重启 VS Code、在 GUI 里点信任，或者在<b>另一个</b>会话里输入斜杠命令。请把要做的事清楚地告诉用户。</li>
+  <li>不要修改 zip 里的任何文件，也不要在用户的代码仓库里创建 <code>.agentd-router</code> 文件。</li>
+  <li><b>路径写法：</b>下面用 <code>&lt;HOME&gt;</code> 表示用户主目录，请先用 <code>echo %USERPROFILE%</code>（cmd）或 <code>$env:USERPROFILE</code>（PowerShell）或 <code>echo $USERPROFILE</code>（Git Bash）查出真实值。在命令和 JSON 里一律用<b>正斜杠</b>，比如 <code>C:/Users/alice</code>；Windows 的 Node、tar 和 claude 都认正斜杠，PowerShell、cmd、Git Bash 三种 shell 里写法也一样，可以避开转义问题。</li>
+  <li><b>跨 shell：</b>下面的命令在 PowerShell 和 Git Bash 里都能直接运行。只有一个例外：Windows PowerShell 5.1 不支持 <code>&amp;&amp;</code>，需要切换目录时请分成两条命令，或者把工具的工作目录设好。</li>
+</ol>
+
+<table>
+  <tr><th>名称</th><th>值</th></tr>
+  <tr><td><code>ZIP</code></td><td>和本 HTML 同一个文件夹下的 <code>agentd-router.zip</code></td></tr>
+  <tr><td><code>MARKET</code></td><td><code>&lt;HOME&gt;/agentd-market</code>：解压目录，也就是 marketplace 来源。装好后必须一直保留</td></tr>
+  <tr><td><code>ROUTER</code></td><td><code>&lt;HOME&gt;/agentd-router</code>：Router 专用的空文件夹</td></tr>
+  <tr><td><code>AGENTD_HOME</code></td><td><code>&lt;HOME&gt;/.agentd</code>：守护进程的配置、数据库和日志</td></tr>
+  <tr><td><code>DAEMON</code></td><td><code>&lt;MARKET&gt;/packages/router-mod/daemon/agentd.mjs</code></td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>1. 检查前置条件</h2>
+<pre><code>node -v
+git --version
+claude --version
+code --version
+where.exe claude</code></pre>
+
+<table>
+  <tr><th>项</th><th>成功标志</th><th>失败时</th></tr>
+  <tr><td>Node</td><td><code>v24.x</code> 或更高</td><td rowspan="2">
+    <span class="box ask" style="padding:1px 6px">问用户</span> 是否用 <code>winget install OpenJS.NodeJS.LTS</code> 和 <code>winget install Git.Git</code> 安装。用户同意后再装，装完让用户重开终端，或者你重新开一个 shell 再检查。</td></tr>
+  <tr><td>Git</td><td>有版本号输出</td></tr>
+  <tr><td>Claude Code</td><td>有版本号输出</td><td>你自己就是 Claude Code，这一项应该总能通过。建议运行一次 <code>claude update</code>，因为插件依赖较新的 <code>claude --bg</code> / <code>claude agents</code>。</td></tr>
+  <tr><td>VS Code</td><td>有版本号输出</td><td>告诉用户：Router 建议在 VS Code 的 Claude Code 扩展里使用。如果用户只用终端版，可以跳过这一项。</td></tr>
+  <tr><td><code>where.exe claude</code></td><td>输出里有一行以 <code>claude.exe</code> 结尾，而且<b>是第一行</b></td><td>
+    守护进程用 Node 的 <code>execFile('claude', …)</code> 起 Worker，不经过 shell，所以运行不了 <code>claude.cmd</code> 或 <code>.ps1</code>（npm 版就是这种）。
+    <ul>
+      <li>一个 <code>.exe</code> 都没有：<span class="box ask" style="padding:1px 6px">问用户</span> 能否安装原生版。安装命令是在 PowerShell 里运行 <code>irm https://claude.ai/install.ps1 | iex</code>。这会执行一个远程脚本，必须得到用户明确同意。</li>
+      <li>有 <code>.exe</code>，但不是第一行：在第 3 步额外设置环境变量 <code>AGENTD_CLAUDE</code>，把它指向这个 <code>.exe</code> 的完整路径。</li>
+    </ul></td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>2. 解压</h2>
+<pre><code>mkdir "&lt;HOME&gt;/agentd-market"
+tar -xf "&lt;ZIP&gt;" -C "&lt;HOME&gt;/agentd-market"</code></pre>
+<p>Windows 10 及以后的版本自带 <code>tar</code>，可以解压 zip。如果 <code>MARKET</code> 已经存在（重装或升级），先删掉它再解压，具体见第 7 节。</p>
+<div class="box ok"><b>成功标志：</b><code>&lt;MARKET&gt;/.claude-plugin/marketplace.json</code> 和 <code>&lt;DAEMON&gt;</code> 这两个文件都存在。</div>
+
+<!-- ============================================================ -->
+<h2>3. 写配置</h2>
+
+<h3>3.1 项目根目录（必做）</h3>
+<div class="box ask">
+<b>问用户：</b>你的代码仓库都放在哪个文件夹下？可以给多个。agentd 只会在这些目录下面（最深 3 层）找 git 仓库，作为可以派活的项目。<br>
+<b>可选，一并问：</b>Worker 默认用 <code>opus</code> 模型。你的账号能用吗？用不了就改成 <code>sonnet</code>。
+</div>
+<p>用你的<b>文件写入工具</b>（不要用 shell 重定向）创建 <code>&lt;HOME&gt;/.agentd/config.json</code>，需要时先建好目录。内容示例：</p>
+<pre><code>{
+  "roots": ["D:/code", "C:/Users/alice/projects"]
+}</code></pre>
+<p>需要改模型时这样写：</p>
+<pre><code>{
+  "roots": ["D:/code"],
+  "worker": { "model": "sonnet" }
+}</code></pre>
+<p>注意三点：</p>
+<ul>
+  <li>文件必须是 <b>UTF-8 无 BOM</b>。守护进程直接 <code>JSON.parse</code>，遇到 BOM 会报错。PowerShell 5.1 的 <code>Set-Content -Encoding utf8</code> 和 <code>Out-File</code> 都会写入 BOM，不要用。</li>
+  <li>路径用正斜杠。<code>~/</code> 开头会展开为用户主目录。</li>
+  <li>其他字段不要写，用默认值即可：端口 7707，交付方式是在本地 worktree 里完成。</li>
+</ul>
+
+<h3>3.2 AGENTD_CLAUDE（仅在第 1 步要求时才做）</h3>
+<pre><code>setx AGENTD_CLAUDE "C:/Users/alice/.local/bin/claude.exe"</code></pre>
+<p>把路径换成 <code>where.exe claude</code> 输出里那个 <code>.exe</code> 的实际路径。<code>setx</code> 只对之后新启动的进程生效，所以第 5 步要让用户完全重启 VS Code。</p>
+
+<!-- ============================================================ -->
+<h2>4. 安装插件</h2>
+<pre><code>claude plugin marketplace add "&lt;HOME&gt;/agentd-market"
+mkdir "&lt;HOME&gt;/agentd-router"
+node -e "require('fs').writeFileSync(process.argv[1], '')" "&lt;HOME&gt;/agentd-router/.agentd-router"</code></pre>
+<p>然后<b>把工作目录切到 <code>ROUTER</code></b>，再执行下面这条（<code>--scope project</code> 按当前目录生效）：</p>
+<pre><code>claude plugin install agentd-router@TerenceXie-agentd --scope project</code></pre>
+
+<table>
+  <tr><th>检查</th><th>成功标志</th></tr>
+  <tr><td><code>marketplace add</code> 的输出</td><td><code>Successfully added marketplace: TerenceXie-agentd</code></td></tr>
+  <tr><td><code>install</code> 的输出</td><td><code>Successfully installed plugin: agentd-router@TerenceXie-agentd (scope: project)</code></td></tr>
+  <tr><td>在 <code>ROUTER</code> 里运行 <code>claude plugin list</code></td><td>能看到 <code>agentd-router@TerenceXie-agentd</code>，<code>Scope: project</code>，<code>Status: enabled</code></td></tr>
+  <tr><td><code>&lt;ROUTER&gt;/.claude/settings.json</code></td><td>包含 <code>"agentd-router@TerenceXie-agentd": true</code></td></tr>
+  <tr><td><code>&lt;ROUTER&gt;/.agentd-router</code></td><td>文件存在，内容为空</td></tr>
+</table>
+<p><b>失败时：</b></p>
+<ul>
+  <li>提示 marketplace 已存在：先运行 <code>claude plugin marketplace remove TerenceXie-agentd</code>，再重新 add。</li>
+  <li>安装时找不到插件：检查第 2 步是否解压到了正确位置，<code>marketplace.json</code> 应该在 <code>MARKET</code> 的 <code>.claude-plugin</code> 子目录里，而不是多套了一层文件夹。</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2>5. 自检守护进程，然后交给用户</h2>
+
+<h3>5.1 自检（你来做）</h3>
+<p>这一步在 Windows 上实际验证一遍：守护进程能起来、能读到配置、能扫描到项目。</p>
+<pre><code>node "&lt;DAEMON&gt;" serve --detach --port 7707 --idle-exit 1800</code></pre>
+<p>等大约 2 秒，然后：</p>
+<pre><code>node "&lt;DAEMON&gt;" status
+node "&lt;DAEMON&gt;" projects --rescan</code></pre>
+
+<table>
+  <tr><th>检查</th><th>成功标志</th><th>失败时</th></tr>
+  <tr><td><code>status</code></td><td>输出 JSON，其中 <code>"ok": true</code>，<code>"projects"</code> 大于 0</td><td>读 <code>&lt;HOME&gt;/.agentd/logs/daemon.log</code> 的最后 80 行。端口被占用（<code>EADDRINUSE</code>）就告诉用户有别的程序在用 7707；JSON 解析错误就回到第 3.1 步检查 BOM 和格式。</td></tr>
+  <tr><td><code>projects --rescan</code></td><td>每行一个「项目名 + 路径」，包含用户的仓库</td><td>列表为空：<code>roots</code> 写错了，或者仓库在 3 层以下，或者目录里没有 <code>.git</code>。把结果给用户看，再修改 <code>roots</code>。</td></tr>
+</table>
+
+<p>自检通过后<b>关掉这个守护进程</b>。它是你的 shell 启动的，拿不到第 3.2 步刚设置的环境变量。关掉之后，等用户打开 Router 时插件会自动重新拉起它：</p>
+<pre><code>curl.exe -s -X POST http://127.0.0.1:7707/shutdown</code></pre>
+<p>在 Git Bash 里写 <code>curl</code> 也可以。成功标志：输出 <code>{"ok":true}</code>，再运行 <code>status</code> 会显示「agentd 不在线」。</p>
+
+<h3>5.2 交给用户</h3>
+<div class="box user">
+<b>用户操作</b>：把下面这段原样转告用户，并把里面的路径换成真实路径。
+<ol>
+  <li><b>完全退出 VS Code</b>，包括所有窗口。如果设置过 <code>AGENTD_CLAUDE</code>，必须这样做才会生效。</li>
+  <li>重新打开 VS Code，用「文件 → 打开文件夹」打开 <code>&lt;ROUTER&gt;</code>。在终端里运行 <code>code "&lt;ROUTER&gt;"</code> 也可以。</li>
+  <li>在这个窗口里打开 Claude Code。如果问你是否信任这个文件夹，选「是」。</li>
+  <li><b>成功的样子：</b>输入框上方有一行状态条，写着 <code>▶ 对 Router 说 · 待处理 0 · 进行中 0</code>，旁边有一个奏折面板。如果是红色的「agentd 守护进程不在线」，在那个窗口里输入 <code>/agentd start</code>。</li>
+  <li><b>每个要派活的项目，都要先信任一次：</b>在终端里进入那个仓库目录，运行 <code>claude</code>，选「信任」，然后输入 <code>/exit</code>。没信任过的仓库 Worker 进不去，Router 会提醒你。</li>
+  <li>试着派一个活。在 Router 里直接说，比如：「在 my-app 里给 README 加一节安装说明」。</li>
+</ol>
+</div>
+
+<!-- ============================================================ -->
+<h2>6. 已知问题与排查</h2>
+
+<table>
+  <tr><th>现象</th><th>原因</th><th>处理</th></tr>
+  <tr><td>面板上的「打开」按钮没反应或报错</td><td>这个按钮用的是 macOS 专有的 <code>osascript</code>/iTerm2 和 <code>open -a</code>，Windows 上不支持</td><td>想看正在干活的 Worker：运行 <code>claude agents</code> 找到它的 ID，再运行 <code>claude attach &lt;ID&gt;</code>。关掉这个窗口不影响 Worker。</td></tr>
+  <tr><td>多出一个黑色控制台窗口</td><td>守护进程以 detached 方式启动，Windows 可能为它单独开一个控制台</td><td>不要关它，关了守护进程就停了。它闲置 30 分钟后会自己退出，下次打开 Router 时会再拉起来。</td></tr>
+  <tr><td>派活后立刻失败，提示里有 <code>EINVAL</code>、<code>ENOENT</code> 或 <code>spawn</code></td><td>守护进程找不到可以直接执行的 <code>claude.exe</code></td><td>回到第 1 步检查 <code>where.exe claude</code>，按需做第 3.2 步，再让用户完全重启 VS Code，在 Router 里输入 <code>/agentd restart</code>，最后对这个任务说「重试」。</td></tr>
+  <tr><td>Router 提示某个目录「尚未被 Claude Code 信任」</td><td>那个仓库没有信任过</td><td>按 5.2 的第 5 条处理，然后对这个任务说「重试」。</td></tr>
+</table>
+
+<p><b>处理不了时</b>，在任意 shell 里收集下面这些信息，连同 Router 窗口的截图一起交给用户，让用户发给作者：</p>
+<pre><code>claude --version
+node -v
+where.exe claude
+node "&lt;DAEMON&gt;" status</code></pre>
+<p>再附上 <code>&lt;HOME&gt;/.agentd/logs/daemon.log</code> 的最后 80 行。</p>
+
+<!-- ============================================================ -->
+<h2>7. 升级（收到新的 zip 时）</h2>
+<p>用户拿到新的 <code>agentd-router.zip</code> 后，可以让 Claude 读本节执行。</p>
+<ol>
+  <li>删掉旧的 <code>MARKET</code> 目录，再按第 2 步把新的 zip 解压到同一个位置。</li>
+  <li>运行 <code>claude plugin marketplace update TerenceXie-agentd</code>。</li>
+  <li>把工作目录切到 <code>ROUTER</code>，运行 <code>claude plugin update agentd-router@TerenceXie-agentd --scope project</code>。成功标志：输出 <code>refreshed from source</code> 或类似的成功字样。插件没有版本号，会显示 <code>unknown</code>，这是正常的。</li>
+  <li><span class="box user" style="padding:1px 6px">用户操作</span> 关掉 Router 窗口重新打开，在 Router 里输入 <code>/agentd restart</code>，把守护进程也换成新版本。如果启动时提示「守护进程跑的是旧构建」，也是做这一步。</li>
+</ol>
+
+<!-- ============================================================ -->
+<h2>8. 卸载</h2>
+<ol>
+  <li>把工作目录切到 <code>ROUTER</code>，运行 <code>claude plugin uninstall agentd-router@TerenceXie-agentd --scope project</code>。</li>
+  <li>运行 <code>claude plugin marketplace remove TerenceXie-agentd</code>。</li>
+  <li>运行 <code>curl.exe -s -X POST http://127.0.0.1:7707/shutdown</code>。守护进程本来没在跑的话，这条会报错，忽略即可。</li>
+  <li>删除 <code>ROUTER</code> 和 <code>MARKET</code> 两个目录。</li>
+  <li>如果设置过环境变量，运行 <code>reg delete HKCU\Environment /v AGENTD_CLAUDE /f</code> 删掉它。</li>
+  <li><span class="box ask" style="padding:1px 6px">问用户</span> 要不要删除 <code>AGENTD_HOME</code>。里面是任务记录和日志，用户确认后才删。</li>
+</ol>
+
+<!-- ============================================================ -->
+<h2>9. 必须告诉用户的三条规则</h2>
+<ol>
+  <li><b><code>.agentd-router</code> 标记文件只能放在 <code>ROUTER</code> 这个专用空文件夹里。</b>Router 会话会禁用 Bash、Read、Edit、Write 等工具；标记文件放进代码仓库的话，用户在那个仓库里就没法正常用 Claude Code 了。</li>
+  <li><b>不要把 <code>AGENTD_ROUTER=1</code> 设成环境变量。</b>设了之后，每个 Claude Code 会话都会变成 Router。</li>
+  <li><b>同一时间只开一个 Router 窗口。</b>全机只有一个守护进程，两个 Router 会收到同样的问题和交付，容易重复回复 Worker。</li>
+</ol>
+
+<h3>Router 常用命令（给用户参考）</h3>
+<table>
+  <tr><th>命令</th><th>作用</th></tr>
+  <tr><td><code>/tickets</code></td><td>列出所有任务（界面上叫「奏折」）</td></tr>
+  <tr><td><code>/ticket 1</code> · <code>/router</code></td><td>和 #1 的 Worker 直接对话 / 回到对 Router 说</td></tr>
+  <tr><td><code>/next</code></td><td>跳到下一个在等你回复的任务</td></tr>
+  <tr><td><code>/r 你的话</code></td><td>在和某个 Worker 单聊时，临时对 Router 说一句</td></tr>
+  <tr><td><code>/agentd status</code> · <code>start</code> · <code>restart</code></td><td>查看 / 启动 / 重启守护进程</td></tr>
+</table>
+<p>派活：直接说「在 &lt;项目名&gt; 里 &lt;要做的事&gt;」。验收：在面板里点「收」，或者说「1 收了」。</p>
+
+</body>
+</html>

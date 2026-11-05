@@ -1,0 +1,11 @@
+{
+  "name": "@agentd/daemon",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": { "agentd": "./dist/agentd.mjs" },
+  "scripts": {
+    "build": "tsdown && node scripts/copy-to-mod.mjs",
+    "typecheck": "tsc --noEmit -p ."
+  }
+}

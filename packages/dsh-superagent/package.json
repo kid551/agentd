@@ -1,0 +1,13 @@
+{
+  "name": "dsh-superagent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Super-agent (Router + Workers) for DeepSeek Harness: a profile plugin with a browser half.",
+  "type": "module",
+  "scripts": {
+    "build": "tsdown && node scripts/wrap-client.mjs",
+    "typecheck": "tsc --noEmit -p .",
+    "install:dsh": "node scripts/install.mjs",
+    "uninstall:dsh": "node scripts/install.mjs --remove"
+  }
+}

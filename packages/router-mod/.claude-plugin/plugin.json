@@ -1,0 +1,7 @@
+{
+  "name": "agentd-router",
+  "description": "agentd 的 Router：在一个 Claude Code 会话里派工、批阅多个后台 Worker 的问题与交付",
+  "author": { "name": "TerenceXie" },
+  "license": "MIT",
+  "types": "./types/index.d.ts"
+}

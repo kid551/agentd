@@ -1,0 +1,18 @@
+history_record.md
+node_modules
+dist
+.spike
+.DS_Store
+*.log
+**/.claude-plugin/types
+router/.claude/settings.json
+router/.claude/settings.local.json
+/output
+
+# Private: never published (AGENTS.md)
+implementation-notes.md
+.sensitive-words
+.private/
+.env
+.env.*
+!.env.example

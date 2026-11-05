@@ -1,0 +1,11 @@
+{
+  "name": "@agentd/router-mod",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "node scripts/typecheck.mjs",
+    "build": "echo router-mod has no build: the engine loads hooks/register.tsx",
+    "test:mod": "claude plugin test ."
+  }
+}

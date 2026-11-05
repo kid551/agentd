@@ -1,0 +1,3 @@
+#!/bin/sh
+# Commit messages are published too. See AGENTS.md.
+exec node scripts/check-sensitive.mjs --message "$1"
