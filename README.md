@@ -53,3 +53,7 @@ curl -s -X POST http://127.0.0.1:7707/shutdown
 ## 贡献
 
 这是公开仓库。提交前请读 [AGENTS.md](AGENTS.md)：`pnpm install` 会装上 pre-commit hook，它会拒绝密钥、个人邮箱、本机路径和内网地址。
+
+## 许可证
+
+MIT，见 [LICENSE](LICENSE)。

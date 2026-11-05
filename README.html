@@ -50,6 +50,7 @@ pnpm build            # 构建守护进程、Worker 侧 MCP server 与审批钩�
 pnpm setup:router     # 注册本仓库为本地插件 marketplace，并只在 router/ 目录启用插件
 code router           # 用 VSCode 打开 Router 工作区，在里面打开 Claude Code</code></pre>
 <p><code>setup:router</code> 做三件事：写 <code>router/.claude/settings.json</code>（Router 用 sonnet，启用插件）；执行 <code>claude plugin marketplace add &lt;本仓库&gt;</code>（用户级登记）；在 <code>router/</code> 下执行 <code>claude plugin install agentd-router@kid551-agentd --scope project</code>。撤销用 <code>claude plugin marketplace remove kid551-agentd</code>。</p>
+<p><b>开发模式和 GitHub 安装二选一</b>：这里把市场 <code>kid551-agentd</code> 登记成本地目录来源，按 README.md 安装是同名的 GitHub 来源，同一时间只能有一个。两边也共用一个守护进程（端口 7707），两份插件的 <code>daemon/</code> 不同就会互相判定对方过期。切换时先 <code>claude plugin marketplace remove kid551-agentd</code>，再跑另一边的安装。开发模式读的是工作区现状，PR 合入后要 <code>git pull</code> 才看得到；GitHub 来源在会话启动时自动更新，要试还没合入的改动，用 <code>claude --plugin-dir &lt;worktree&gt;/packages/router-mod</code> 只在当次会话加载。</p>
 <p>市场先后叫过 <code>agentd</code> 和 <code>TerenceXie-agentd</code>。脚本可以重复跑：开头先把这两个旧名 <code>marketplace remove</code> 掉（没登记过就跳过），并从 settings 里删掉对应的 <code>agentd-router@…</code>，否则同一个插件会以两个 ID 各加载一次，每个钩子触发两次。跑完把开着的 Router 窗口重开或 <code>/reload-plugins</code>；守护进程和 Worker 不受影响。</p>
 <p>要派工的项目放在 <code>~/.agentd/config.json</code> 的 <code>roots</code> 下（默认 <code>~/code</code>）。守护进程不用手动启动：打开 Router 会话时插件会自动拉起它。</p>
 
