@@ -1,7 +1,7 @@
 {
-  "name": "TerenceXie-agentd",
+  "name": "kid551-agentd",
   "description": "agentd：在一个 Claude Code 会话里派工给多个后台 Worker",
-  "owner": { "name": "TerenceXie" },
+  "owner": { "name": "kid551" },
   "plugins": [
     {
       "name": "agentd-router",

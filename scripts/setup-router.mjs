@@ -16,23 +16,29 @@ if (!existsSync(join(repo, 'packages', 'router-mod', 'daemon', 'agentd.mjs'))) {
   process.exit(1)
 }
 
-const MARKET = 'TerenceXie-agentd'
+const MARKET = 'kid551-agentd'
 const PLUGIN = `agentd-router@${MARKET}`
-// Names this script registered before the marketplace was renamed. Left in
-// place beside the new ones, the plugin would load twice and every hook fire
+// Names the marketplace had before (agentd, then TerenceXie-agentd). Left in
+// place beside the new one, the plugin would load twice and every hook fire
 // twice, so they go first. Removing the marketplace uninstalls its plugin.
-const OLD_MARKET = 'agentd'
+const OLD_MARKETS = ['agentd', 'TerenceXie-agentd']
 const claude = (args, cwd, stdio = 'inherit') => execFileSync('claude', args, { cwd, stdio })
-try {
-  claude(['plugin', 'marketplace', 'remove', OLD_MARKET], repo, 'pipe')
-  console.log(`removed the old marketplace ${OLD_MARKET}`)
-} catch {
-  // Not registered: nothing to migrate.
+for (const old of OLD_MARKETS) {
+  try {
+    claude(['plugin', 'marketplace', 'remove', old], repo, 'pipe')
+    console.log(`removed the old marketplace ${old}`)
+  } catch {
+    // Not registered: nothing to migrate.
+  }
 }
 
 const current = existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : {}
-const { [OLD_MARKET]: _oldMarket, ...markets } = current.extraKnownMarketplaces ?? {}
-const { [`agentd-router@${OLD_MARKET}`]: _oldPlugin, ...plugins } = current.enabledPlugins ?? {}
+const markets = { ...current.extraKnownMarketplaces }
+const plugins = { ...current.enabledPlugins }
+for (const old of OLD_MARKETS) {
+  delete markets[old]
+  delete plugins[`agentd-router@${old}`]
+}
 const settings = {
   ...current,
   model: current.model ?? 'sonnet',

@@ -41,7 +41,7 @@
 <!-- ============================================================ -->
 <h2>0. 给 Claude：背景与执行规则</h2>
 
-<p><b>要装的是什么：</b>agentd-router 是一个 Claude Code 插件，以本地目录 marketplace 的形式分发。marketplace 名为 <code>TerenceXie-agentd</code>，插件名为 <code>agentd-router</code>。装好后，用户在一个专用文件夹里打开的 Claude Code 会话会变成 <b>Router</b>：用户用自然语言派活，插件通过本机的守护进程（Node 脚本，HTTP 监听 <code>127.0.0.1:7707</code>，数据放在 <code>~/.agentd</code>）为每个任务起一个后台 <code>claude --bg</code>（Worker），让它到对应的 git 仓库里工作。这个包不需要 build，zip 里已经带有构建好的 <code>.mjs</code>。</p>
+<p><b>要装的是什么：</b>agentd-router 是一个 Claude Code 插件，以本地目录 marketplace 的形式分发。marketplace 名为 <code>kid551-agentd</code>，插件名为 <code>agentd-router</code>。装好后，用户在一个专用文件夹里打开的 Claude Code 会话会变成 <b>Router</b>：用户用自然语言派活，插件通过本机的守护进程（Node 脚本，HTTP 监听 <code>127.0.0.1:7707</code>，数据放在 <code>~/.agentd</code>）为每个任务起一个后台 <code>claude --bg</code>（Worker），让它到对应的 git 仓库里工作。这个包不需要 build，zip 里已经带有构建好的 <code>.mjs</code>。</p>
 
 <p><b>执行规则：</b></p>
 <ol>
@@ -126,19 +126,19 @@ tar -xf "&lt;ZIP&gt;" -C "&lt;HOME&gt;/agentd-market"</code></pre>
 mkdir "&lt;HOME&gt;/agentd-router"
 node -e "require('fs').writeFileSync(process.argv[1], '')" "&lt;HOME&gt;/agentd-router/.agentd-router"</code></pre>
 <p>然后<b>把工作目录切到 <code>ROUTER</code></b>，再执行下面这条（<code>--scope project</code> 按当前目录生效）：</p>
-<pre><code>claude plugin install agentd-router@TerenceXie-agentd --scope project</code></pre>
+<pre><code>claude plugin install agentd-router@kid551-agentd --scope project</code></pre>
 
 <table>
   <tr><th>检查</th><th>成功标志</th></tr>
-  <tr><td><code>marketplace add</code> 的输出</td><td><code>Successfully added marketplace: TerenceXie-agentd</code></td></tr>
-  <tr><td><code>install</code> 的输出</td><td><code>Successfully installed plugin: agentd-router@TerenceXie-agentd (scope: project)</code></td></tr>
-  <tr><td>在 <code>ROUTER</code> 里运行 <code>claude plugin list</code></td><td>能看到 <code>agentd-router@TerenceXie-agentd</code>，<code>Scope: project</code>，<code>Status: enabled</code></td></tr>
-  <tr><td><code>&lt;ROUTER&gt;/.claude/settings.json</code></td><td>包含 <code>"agentd-router@TerenceXie-agentd": true</code></td></tr>
+  <tr><td><code>marketplace add</code> 的输出</td><td><code>Successfully added marketplace: kid551-agentd</code></td></tr>
+  <tr><td><code>install</code> 的输出</td><td><code>Successfully installed plugin: agentd-router@kid551-agentd (scope: project)</code></td></tr>
+  <tr><td>在 <code>ROUTER</code> 里运行 <code>claude plugin list</code></td><td>能看到 <code>agentd-router@kid551-agentd</code>，<code>Scope: project</code>，<code>Status: enabled</code></td></tr>
+  <tr><td><code>&lt;ROUTER&gt;/.claude/settings.json</code></td><td>包含 <code>"agentd-router@kid551-agentd": true</code></td></tr>
   <tr><td><code>&lt;ROUTER&gt;/.agentd-router</code></td><td>文件存在，内容为空</td></tr>
 </table>
 <p><b>失败时：</b></p>
 <ul>
-  <li>提示 marketplace 已存在：先运行 <code>claude plugin marketplace remove TerenceXie-agentd</code>，再重新 add。</li>
+  <li>提示 marketplace 已存在：先运行 <code>claude plugin marketplace remove kid551-agentd</code>，再重新 add。</li>
   <li>安装时找不到插件：检查第 2 步是否解压到了正确位置，<code>marketplace.json</code> 应该在 <code>MARKET</code> 的 <code>.claude-plugin</code> 子目录里，而不是多套了一层文件夹。</li>
 </ul>
 
@@ -198,16 +198,16 @@ node "&lt;DAEMON&gt;" status</code></pre>
 <p>用户拿到新的 <code>agentd-router.zip</code> 后，可以让 Claude 读本节执行。</p>
 <ol>
   <li>删掉旧的 <code>MARKET</code> 目录，再按第 2 步把新的 zip 解压到同一个位置。</li>
-  <li>运行 <code>claude plugin marketplace update TerenceXie-agentd</code>。</li>
-  <li>把工作目录切到 <code>ROUTER</code>，运行 <code>claude plugin update agentd-router@TerenceXie-agentd --scope project</code>。成功标志：输出 <code>refreshed from source</code> 或类似的成功字样。插件没有版本号，会显示 <code>unknown</code>，这是正常的。</li>
+  <li>运行 <code>claude plugin marketplace update kid551-agentd</code>。</li>
+  <li>把工作目录切到 <code>ROUTER</code>，运行 <code>claude plugin update agentd-router@kid551-agentd --scope project</code>。成功标志：输出 <code>refreshed from source</code> 或类似的成功字样。插件没有版本号，会显示 <code>unknown</code>，这是正常的。</li>
   <li><span class="box user" style="padding:1px 6px">用户操作</span> 关掉 Router 窗口重新打开，在 Router 里输入 <code>/agentd restart</code>，把守护进程也换成新版本。如果启动时提示「守护进程跑的是旧构建」，也是做这一步。</li>
 </ol>
 
 <!-- ============================================================ -->
 <h2>8. 卸载</h2>
 <ol>
-  <li>把工作目录切到 <code>ROUTER</code>，运行 <code>claude plugin uninstall agentd-router@TerenceXie-agentd --scope project</code>。</li>
-  <li>运行 <code>claude plugin marketplace remove TerenceXie-agentd</code>。</li>
+  <li>把工作目录切到 <code>ROUTER</code>，运行 <code>claude plugin uninstall agentd-router@kid551-agentd --scope project</code>。</li>
+  <li>运行 <code>claude plugin marketplace remove kid551-agentd</code>。</li>
   <li>运行 <code>curl.exe -s -X POST http://127.0.0.1:7707/shutdown</code>。守护进程本来没在跑的话，这条会报错，忽略即可。</li>
   <li>删除 <code>ROUTER</code> 和 <code>MARKET</code> 两个目录。</li>
   <li>如果设置过环境变量，运行 <code>reg delete HKCU\Environment /v AGENTD_CLAUDE /f</code> 删掉它。</li>
