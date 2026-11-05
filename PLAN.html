@@ -370,7 +370,7 @@ mod 用 <code>$.clock.after(5000)</code> 注入一句话，看 Router 是否响�
 <tr><td>agentd-mcp</td><td>Node 24</td><td>tsdown 打成 <code>dist/agentd-mcp.mjs</code> 单文件</td></tr>
 </table>
 <ul>
-  <li><b>安装入口</b>：仓库根 <code>.claude-plugin/marketplace.json</code>；对方 <code>/plugin install agentd --marketplace TerenceXie/agentd</code>。试用可 <code>claude --plugin-url &lt;Release zip&gt;</code>。</li>
+  <li><b>安装入口</b>：仓库根 <code>.claude-plugin/marketplace.json</code>；对方 <code>/plugin install agentd --marketplace kid551/agentd</code>。试用可 <code>claude --plugin-url &lt;Release zip&gt;</code>。</li>
   <li><b>产物位置</b>：<code>dist/</code> 不提交，<code>pnpm build</code> 后打 tag 发 GitHub Release zip。</li>
   <li><b>守护进程自举</b>（第 10 步）：mod 起 <code>node &lt;plugin&gt;/dist/agentd.mjs</code>，Windows 无需 launchd / 任务计划。</li>
   <li><b>个人配置</b>（<code>roots</code> 等）走 plugin <code>userConfig</code>，首次加载问一次。</li>

@@ -49,8 +49,8 @@
 pnpm build            # 构建守护进程、Worker 侧 MCP server 与审批钩子，并复制进 router-mod/daemon/
 pnpm setup:router     # 注册本仓库为本地插件 marketplace，并只在 router/ 目录启用插件
 code router           # 用 VSCode 打开 Router 工作区，在里面打开 Claude Code</code></pre>
-<p><code>setup:router</code> 做三件事：写 <code>router/.claude/settings.json</code>（Router 用 sonnet，启用插件）；执行 <code>claude plugin marketplace add &lt;本仓库&gt;</code>（用户级登记）；在 <code>router/</code> 下执行 <code>claude plugin install agentd-router@TerenceXie-agentd --scope project</code>。撤销用 <code>claude plugin marketplace remove TerenceXie-agentd</code>。</p>
-<p>市场原名 <code>agentd</code>。脚本可以重复跑：开头先 <code>marketplace remove agentd</code>（没登记过就跳过），并从 settings 里删掉 <code>agentd-router@agentd</code>，否则同一个插件会以两个 ID 各加载一次，每个钩子触发两次。跑完把开着的 Router 窗口重开或 <code>/reload-plugins</code>；守护进程和 Worker 不受影响。</p>
+<p><code>setup:router</code> 做三件事：写 <code>router/.claude/settings.json</code>（Router 用 sonnet，启用插件）；执行 <code>claude plugin marketplace add &lt;本仓库&gt;</code>（用户级登记）；在 <code>router/</code> 下执行 <code>claude plugin install agentd-router@kid551-agentd --scope project</code>。撤销用 <code>claude plugin marketplace remove kid551-agentd</code>。</p>
+<p>市场先后叫过 <code>agentd</code> 和 <code>TerenceXie-agentd</code>。脚本可以重复跑：开头先把这两个旧名 <code>marketplace remove</code> 掉（没登记过就跳过），并从 settings 里删掉对应的 <code>agentd-router@…</code>，否则同一个插件会以两个 ID 各加载一次，每个钩子触发两次。跑完把开着的 Router 窗口重开或 <code>/reload-plugins</code>；守护进程和 Worker 不受影响。</p>
 <p>要派工的项目放在 <code>~/.agentd/config.json</code> 的 <code>roots</code> 下（默认 <code>~/code</code>）。守护进程不用手动启动：打开 Router 会话时插件会自动拉起它。</p>
 
 <h3>1.2 日常</h3>
@@ -361,7 +361,7 @@ GET  /events?since=游标&amp;wait=秒</code></pre>
 </table>
 
 <h3>6.4 分享给别人</h3>
-<p>本仓库本身就是插件市场 <code>TerenceXie-agentd</code>（<code>.claude-plugin/marketplace.json</code>），别人不用 clone、不用 build。</p>
+<p>本仓库本身就是插件市场 <code>kid551-agentd</code>（<code>.claude-plugin/marketplace.json</code>），别人不用 clone、不用 build。</p>
 <p><b>对方需要：</b>Node ≥ 24（守护进程用 <code>node</code> 跑）；<code>git</code>（GitHub 来源的市场靠它 clone）；<code>claude</code> 在 PATH 上（守护进程用它起 Worker）。仓库是公开的，不用 SSH key 也不用登录 GitHub。macOS 以外未验证：「打开」按钮用的 <code>open -a</code> 是 macOS 专用。</p>
 <p><b>安装</b>：照仓库根的 <a href="README.md">README.md</a> 做（GitHub 首页显示的就是它），一段命令贴进终端即可。VSCode 插件版与终端版共用这套配置。它做三件事：</p>
 <ol>
@@ -369,7 +369,7 @@ GET  /events?since=游标&amp;wait=秒</code></pre>
   <li>先写 <code>.claude/settings.json</code>，在 <code>extraKnownMarketplaces</code> 里声明这个市场并带上 <code>"autoUpdate": true</code>。</li>
   <li><code>claude plugin install agentd-router --marketplace kid551/agentd --scope project</code>：<code>--marketplace</code> 让一条命令先在用户级登记市场、再装插件；<code>--scope project</code> 往同一个 settings 里加 <code>enabledPlugins</code>，上一步写的条目原样保留（2.1.318 实测）。</li>
 </ol>
-<p><b>为什么第 2 步要在 install 之前手写</b>：第三方市场默认不自动更新，<code>marketplace.json</code> 没有字段能替用户打开，<code>marketplace add</code> 也没有对应参数。官方文档写明 settings 文件里 <code>extraKnownMarketplaces</code> 条目上的 <code>autoUpdate</code> 会被读取，项目级的要在文件夹被信任后才生效。所以把它放进 Router 文件夹的项目设置：只影响这一个市场，也不用碰用户的全局设置。不写的话，每人要手动开一次：<code>/plugin</code> → Marketplaces → <code>TerenceXie-agentd</code> → Enable auto-update。</p>
+<p><b>为什么第 2 步要在 install 之前手写</b>：第三方市场默认不自动更新，<code>marketplace.json</code> 没有字段能替用户打开，<code>marketplace add</code> 也没有对应参数。官方文档写明 settings 文件里 <code>extraKnownMarketplaces</code> 条目上的 <code>autoUpdate</code> 会被读取，项目级的要在文件夹被信任后才生效。所以把它放进 Router 文件夹的项目设置：只影响这一个市场，也不用碰用户的全局设置。不写的话，每人要手动开一次：<code>/plugin</code> → Marketplaces → <code>kid551-agentd</code> → Enable auto-update。</p>
 <p><b>更新</b>：开了自动更新的，每次会话启动在后台检查新提交，下次会话生效（或 <code>/reload-plugins</code>）。手动更新是 <code>marketplace update</code> 加 <code>plugin update</code>，命令见 README.md。插件更新后守护进程还是旧的，Router 会提示 <code>/agentd restart</code>（见第 4 节「守护进程会过期」）。2026-11-05 仓库历史被重写过；在那之前装的人照常 update 即可：<code>marketplace update</code> 发现本地副本和远端历史对不上会重新 clone（实测）。</p>
 <p><b>发版</b>：改代码 → <code>pnpm check</code>（最后一步 build 会把产物复制进 <code>packages/router-mod/daemon/</code>）→ 连同 <code>daemon/</code> 一起提交 → push main。三件事让它成立：</p>
 <ul>

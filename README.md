@@ -15,7 +15,7 @@ mkdir -p ~/agentd-router/.claude && cd ~/agentd-router && touch .agentd-router
 cat > .claude/settings.json <<'EOF'
 {
   "extraKnownMarketplaces": {
-    "TerenceXie-agentd": {
+    "kid551-agentd": {
       "source": { "source": "github", "repo": "kid551/agentd" },
       "autoUpdate": true
     }
@@ -36,15 +36,17 @@ code .
 - **手动**：
 
   ```sh
-  claude plugin marketplace update TerenceXie-agentd
-  cd ~/agentd-router && claude plugin update agentd-router@TerenceXie-agentd --scope project
+  claude plugin marketplace update kid551-agentd
+  cd ~/agentd-router && claude plugin update agentd-router@kid551-agentd --scope project
   ```
+
+2026-11-05 前按旧名 `TerenceXie-agentd` 装过的：先执行 `claude plugin marketplace remove TerenceXie-agentd`，再按上面的安装步骤重装（`.claude/settings.json` 会被覆盖成新名字）。
 
 ## 卸载
 
 ```sh
-cd ~/agentd-router && claude plugin uninstall agentd-router@TerenceXie-agentd --scope project
-claude plugin marketplace remove TerenceXie-agentd
+cd ~/agentd-router && claude plugin uninstall agentd-router@kid551-agentd --scope project
+claude plugin marketplace remove kid551-agentd
 curl -s -X POST http://127.0.0.1:7707/shutdown
 ```
 
