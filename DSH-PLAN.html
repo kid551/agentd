@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>dsh-superagent · 把 Super-agent 做进 DeepSeek Harness</title>
+<style>
+  :root { --fg:#1f2328; --muted:#656d76; --line:#d0d7de; --soft:#f6f8fa; --accent:#0969da; --warnbg:#fff8c5; --warn:#9a6700; --okbg:#dafbe1; --ok:#1a7f37; --badbg:#ffebe9; --bad:#cf222e; }
+  body { font: 15px/1.7 -apple-system, "PingFang SC", "Helvetica Neue", sans-serif; color:var(--fg); max-width: 980px; margin: 40px auto; padding: 0 24px; }
+  h1 { font-size: 26px; border-bottom: 1px solid var(--line); padding-bottom: 10px; }
+  h2 { font-size: 20px; margin-top: 48px; border-bottom: 1px solid var(--line); padding-bottom: 6px; }
+  h3 { font-size: 16px; margin-top: 28px; }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
+  code { background: var(--soft); padding: 1px 5px; border-radius: 4px; }
+  pre { background: var(--soft); padding: 12px 14px; border-radius: 6px; overflow-x: auto; line-height: 1.5; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; }
+  th, td { border: 1px solid var(--line); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--soft); white-space: nowrap; }
+  .muted { color: var(--muted); }
+  .note { border-left: 4px solid var(--warn); background: var(--warnbg); padding: 10px 14px; margin: 14px 0; }
+  .ok { border-left: 4px solid var(--ok); background: var(--okbg); padding: 10px 14px; margin: 14px 0; }
+  .bad { border-left: 4px solid var(--bad); background: var(--badbg); padding: 10px 14px; margin: 14px 0; }
+  .toc { background: var(--soft); padding: 12px 20px; border-radius: 6px; }
+  .tag { display:inline-block; font-size:12px; padding:0 6px; border-radius:10px; border:1px solid var(--line); color:var(--muted); }
+  .rec { color: var(--ok); font-weight: 600; }
+</style>
+</head>
+<body>
+
+<h1>dsh-superagent：把 Super-agent 做进 DeepSeek Harness</h1>
+<p class="muted">2026-11-04 · 方案草稿，待你审阅 · 依据：《Super-agent 设计探索》PDF、agentd 现有实现（PLAN.html / implementation-notes.md 偏差 1–47）、安装版 DeepSeek Harness 0.2.1-rc.5 的包源码（已从 app.asar 解出核对，本地 deepseek-harness 仓库落后 origin/master 819 个提交，只作参考）。</p>
+
+<div class="toc">
+<b>目录</b>
+<ol>
+  <li><a href="#tldr">一句话结论</a></li>
+  <li><a href="#decisions">需要你拍板的决策（最可能调整的放最前）</a></li>
+  <li><a href="#ux">用户可见的样子</a></li>
+  <li><a href="#model">数据模型与类型接口</a></li>
+  <li><a href="#arch">架构</a></li>
+  <li><a href="#pdf">PDF 六个模块在 dsh 里的落地</a></li>
+  <li><a href="#vs">相对 agentd：哪些绕法不再需要</a></li>
+  <li><a href="#risks">风险与必须先做的 spike</a></li>
+  <li><a href="#phases">分期</a></li>
+  <li><a href="#mech">机械部分：包结构、构建、测试、安装</a></li>
+</ol>
+</div>
+
+<h2 id="tldr">1. 一句话结论</h2>
+<p>做成一个<b>树外 bundle 包</b> <code>dsh-superagent</code>，装进 <code>~/.dsh/profiles/desktop</code>。它带一个宿主插件（奏折存储、状态机、派工、事件路由、批处理注入、Watchdog）、两个 agent preset（<code>superagent-router</code>、<code>superagent-worker</code>），以及一个 <code>dsh.client</code> 浏览器侧（奏折主面板、会话行徽标、输入框上方的 band）。</p>
+<p>Router 和 Worker 都是 dsh 的<b>原生根会话</b>，由插件用 <code>ctx.agents.create()</code> 创建。不再有外部守护进程、HTTP、MCP 壳和 CLI 对账。</p>
+
+<h2 id="decisions">2. 需要你拍板的决策</h2>
+<p class="muted">每条都给出推荐和理由。<span class="rec">绿色</span>为推荐项。</p>
+
+<h3>D1 · Worker 的形态：根会话 还是 Router 的子会话（subagent）</h3>
+<table>
+<tr><th></th><th>根会话（<code>ctx.agents.create</code>，不设 parentAgent）</th><th>子会话（<code>ctx.subagents.startActivation</code>）</th></tr>
+<tr><td>在侧栏可见</td><td>是，归入对应项目的 Workspace（需 <code>workspaceRegistry.attachSession</code>）</td><td>否，只能从 Router 的标题栏目录进入</td></tr>
+<tr><td>每个 Worker 自己的 cwd / 模型 / preset</td><td>都可以（<code>meta.cwd</code>、<code>agentOptions</code>、setup 里 mount preset）</td><td>preset 可以；cwd 默认继承父会话</td></tr>
+<tr><td>向用户提问 / 请求审批</td><td>可以，走 dsh 原生界面</td><td><b>不行</b>：子会话的审批会被自动拒绝，提问被拒（<code>DELEGATED_CALLER</code>）</td></tr>
+<tr><td>并发上限</td><td>插件自己定</td><td>每棵树 8 个（<code>maxActiveSubagents</code>）</td></tr>
+<tr><td>和父会话通信</td><td>插件自己做（followup / steer / inject）</td><td>现成的完成通知与 sendMessage</td></tr>
+</table>
+<p class="rec">推荐根会话。子会话不能提问、不能请求审批，这一条就足以排除：Worker 卡在审批上正是 agentd 最大的痛点（偏差 36–41）。</p>
+
+<h3>D2 · 「单聊」= 直接切到 Worker 会话里说话</h3>
+<p>agentd 的单聊是在 Router 输入框里截流，再把话转给 Worker。这样做是因为 Worker 在 VSCode 里不好打开，而且转达的话审查不认（偏差 41）。dsh 里这两个前提都不存在了：</p>
+<ol>
+  <li>Worker 是侧栏里的普通会话，<code>ctx.uiWorkspace.openSession(id)</code> 一步就能打开。</li>
+  <li>你在 Worker 会话里打的字就是那个会话里的用户消息，审批天然认可。</li>
+  <li>dsh 也没有通用的提交前钩子，只能截 <code>/</code> 和 <code>@</code> 开头的行。硬截流要么替换整个输入框，要么监听 DOM 按键，都很脆弱。</li>
+</ol>
+<p class="rec">推荐：单聊就是打开 Worker 会话。Worker 会话的输入框上方挂一条 band，写着「单聊 #12 · 返回 Router」。插件监听 Worker 会话里的 <code>user/message</code>，往 Router 里 <code>inject</code> 一行「你对 #12 说了…」，只补上下文、不唤醒 Router，保持 Router 的全局记忆完整。</p>
+<p>保留一个轻量通道：在 Router 里打 <code>@12 内容</code>，由 inputTriggers 认领后，以 queue 方式发给 #12。这适合不想切换会话的短指令。</p>
+<p class="rec">已定（2026-11-04）：单聊 = 切到 Worker 会话，加 <code>@12</code> 短指令。</p>
+
+<h3>D3 · 提问与审批：原生处理，只做镜像</h3>
+<p>Worker 用 dsh 原生的提问工具和审批弹窗。插件在 Worker 的 agentCtx 上挂 <code>user-questions/request</code> 和 <code>approval/request</code> 的 waterfall 监听，只观察、调用 <code>next()</code> 放行：把奏折标成 asking，往 Router 推一条事件，在面板和侧栏行上亮黄点。你可以点进 Worker 原地回答，也可以让 Router 转述后在单聊里答。</p>
+<p class="rec">推荐只做镜像、不拦截。agentd 的整套 PermissionDenied、PreToolUse、grant 标记文件、批准词判定（偏差 36–39）都可以删掉。代价是答题必须进 Worker 会话，不能在 Router 里一句话替它批准。这一点是故意的：Router 模型不应该能替你批准。</p>
+<p>备选：拦截后改由 Router 代答（waterfall 支持直接返回答案）。只用于普通提问，审批永远不代答。</p>
+<p class="rec">已定（2026-11-04）：原生处理，插件只做镜像。</p>
+
+<h3>D4 · 奏折存储：dsh 的 storage-domain（JSON） 还是 自带 SQLite</h3>
+<p>dsh 给插件的正规存储是 <code>ctx.storageDomain.open(defineDomain(...))</code>：落在 <code>~/.dsh/storages</code>，同步读、持久写，变更时发 <code>domain/changed</code>。dsh 没有给插件用的 SQLite 服务。自己用 <code>node:sqlite</code> 能跑，但不在支持范围内，HMR 卸载时还得自己管连接。</p>
+<p class="rec">推荐 storage-domain。量级是几百张奏折、几千条事件，不需要索引和 SQL。状态机迁移的原子性改用「单写者 + 内存串行队列」保证：只有宿主插件写，所有迁移经过同一个 <code>apply()</code>。事件表要设上限，超出的旧事件归档到 spill。</p>
+
+<h3>D5 · 执行器范围：只派 dsh Worker，还是也能派 Claude Code Worker</h3>
+<p>「放开思路」的一个方向：dsh 的 Router 作为唯一入口，Worker 定义成一个可替换的 executor seam。</p>
+<ul>
+  <li><code>dsh</code>：dsh 原生根会话，用 DeepSeek 或其他已配置的模型。</li>
+  <li><code>claude</code>：把奏折转交给 agentd 守护进程的 HTTP API，由它起 <code>claude --bg</code>。agentd 降级为「Claude Code 执行器适配层」，Router 层整体搬到 dsh。</li>
+</ul>
+<p class="rec">已定（2026-11-04）：v1 只派 dsh 原生 Worker，executor 字段与接口留口，agentd 保持独立。</p>
+
+<h3>D6 · 应用退出时 Worker 怎么办</h3>
+<p>Worker 跑在桌面应用的宿主进程里，应用一关它们就停了。会话日志会保留，可以冷恢复。HMR 重载插件也会销毁插件创建的 agent（见 spike S2）。</p>
+<p class="rec">推荐：重启后把 working / asking 的奏折标为 <code>interrupted</code>（新状态），不自动续跑。面板给出「恢复」按钮，语义同 agentd 偏差 46：先只读自查、汇报、提问，回答之前不做写操作。理由：被打断的 Worker 可能停在一次部署中途。</p>
+<p class="rec">已定（2026-11-04）：标 interrupted，等你点恢复。</p>
+<p>备选（未采用）：自动恢复 working 的奏折。要「一直在线」，应该把同一个 bundle 装进 headless 或 web profile，常驻跑在另一台机器上（第 6 节 §5），而不是让桌面应用自作主张。</p>
+
+<h3>D7 · 模型</h3>
+<p class="note">实施偏差（2026-11-04）：v1 里 Router 和 Worker 都用你当前的默认模型，见 implementation-notes「dsh-superagent」偏差 1。</p>
+<p>Router 用轻模型（你当前默认的 <code>deepseek-flash</code>），Worker 用最强的可用模型，两者都可以在 bundle 配置里改。用 <code>agentOptions</code> 按会话指定模型。<b>不要</b>用 <code>sessionController.selectModel()</code>：它会顺手把你的全局默认模型改掉。</p>
+
+<h3>D8 · 代码放哪</h3>
+<p class="rec">已定（2026-11-04）：放在 agentd monorepo，新增 <code>packages/dsh-superagent</code>。纯逻辑先复制过来移植，v2 接 agentd 时再抽成 <code>packages/core</code> 共享。</p>
+
+<h2 id="ux">3. 用户可见的样子</h2>
+<pre><code>┌ 左侧栏 ────────────────┐ ┌ 主区域 ───────────────────────────────────────┐
+│ [≡ 奏折] ← panellist 图标 │ │  Router 会话（superagent 工作区）              │
+│                          │ │  …你：把 agentd 的 README 翻成英文            │
+│ ▾ superagent             │ │  Router：已派 #14 → agentd                    │
+│   · Router               │ │  [agentd] 2 条新事件：#12 问…；#13 已交付…     │
+│ ▾ agentd                 │ │                                               │
+│   🟡 #12 修审批钩子       │ │ ┌ band（conversation.input.dock）────────────┐ │
+│   🟢 #14 README 英文版    │ │ │ 对 Router 说 · 待处理 2 · 在干 3            │ │
+│ ▾ acme               │ │ └────────────────────────────────────────────┘ │
+│   🔵 #13 CI 修复（待验收） │ │ [ 输入框 ]                                     │
+└──────────────────────────┘ └───────────────────────────────────────────────┘
+  ↑ 徽标：sidebar.session.row.leading；hover 卡片显示最近两行动作
+</code></pre>
+<ol>
+  <li><b>奏折主面板</b>（<code>sidebar.panellist</code> + <code>main</code>）：按「待我处理 / 进行中 / 已结束」分组。卡片带状态色、项目色标签、Markdown 全文汇报，在干的卡片显示 Worker 最近两行动作。按钮：单聊（打开会话）、停、重试、恢复、收。</li>
+  <li><b>侧栏行徽标</b>：Worker 会话行前的状态点，hover 时显示奏折号和最近动作。</li>
+  <li><b>band</b>：Router 会话里写「对 Router 说 · 待处理 N」；Worker 会话里写「单聊 #12 · 返回 Router」。颜色沿用 agentd 偏差 20 的语义，但改用 dsh 主题 token。</li>
+  <li><b>Router 会话本身</b>：放在固定的 <code>superagent</code> 工作区（如 <code>~/.dsh/superagent/router</code>），首次打开 dsh 时自动创建并置顶。</li>
+  <li><b>命令</b>：<code>/next</code> 跳到下一张待处理奏折的会话；<code>/tickets</code> 打开面板；<code>@12 …</code> 从 Router 给 #12 发短指令。</li>
+</ol>
+
+<h2 id="model">4. 数据模型与类型接口</h2>
+<h3>4.1 存储（storage-domain <code>superagent</code>，version 1）</h3>
+<pre><code>tickets: {
+  id: number                 // 自增，界面显示 #id
+  title: string
+  task: string               // 任务原文
+  executor: 'dsh'            // D5 留口：'claude'
+  projectPath: string        // 真实路径
+  workspaceId?: string       // dsh Workspace
+  sessionId?: string         // Worker 会话；创建前为空
+  worktree?: string
+  model: { provider: string; model: string; reasoningEffort?: string }
+  state: TicketState
+  pending?: { kind: 'question' | 'approval'; summary: string; at: number }
+  lastReport?: string
+  createdAt: number; endedAt?: number
+}
+events: {                     // 只追加；上限 N 条/奏折，超出归档
+  id: number; ticketId: number
+  kind: 'dispatched' | 'progress' | 'ask' | 'approval' | 'answered' | 'user-said'
+      | 'ready' | 'blocked' | 'failed' | 'stalled' | 'interrupted' | 'resumed'
+      | 'message' | 'closed' | 'stopped'
+  body: string; actor: 'router' | 'worker' | 'user' | 'superagent'; at: number
+  routerSeen: boolean         // 是否已批量注入 Router
+}
+meta: { routerSessionId?: string; lastEventId: number }</code></pre>
+
+<h3>4.2 状态机（沿用 agentd <code>state.ts</code>，增删两处）</h3>
+<table>
+<tr><th>状态</th><th>变化</th></tr>
+<tr><td>queued / working / asking / ready / blocked / failed / done / stopped</td><td>保留，含义同 agentd。</td></tr>
+<tr><td><code>interrupted</code></td><td><b>新增</b>（D6）：应用退出或 HMR 重载时，处于 working/asking 的奏折进入此状态；<code>resume</code> 后回到 working。</td></tr>
+<tr><td>asking</td><td>含义变化：由原生提问/审批的 waterfall 观察进入；用户在 Worker 会话里回答后，监听到 <code>answered</code> 退出。不再有「问题表」和撤回逻辑，问题本身由 dsh 管。</td></tr>
+</table>
+
+<h3>4.3 宿主服务 <code>ctx.superAgent</code>（preset 行通过 inject 取得）</h3>
+<pre><code>interface SuperAgent {
+  dispatch(input: { title: string; task: string; project: string; worktree?: boolean }): Promise&lt;Ticket&gt;
+  message(id: number, text: string): Promise&lt;void&gt;       // Router → Worker：idle 则 followup，否则 steer
+  stop(id: number): Promise&lt;void&gt;
+  retry(id: number): Promise&lt;void&gt;                        // blocked/failed
+  resume(id: number): Promise&lt;void&gt;                       // stopped/interrupted
+  close(id: number): Promise&lt;void&gt;                        // 收：dispose Worker agent，保留会话
+  list(filter?: TicketFilter): Ticket[]
+  read(id: number, depth: 'summary' | 'events' | 'transcript'): Promise&lt;string&gt;   // 链式召回
+  projects(query?: string): Project[]
+  // Worker 侧（worker preset 的工具调用）
+  report(sessionId: string, text: string): void
+  done(sessionId: string, outcome: 'ready' | 'blocked' | 'failed' | 'dropped', text: string): void
+}</code></pre>
+
+<h3>4.4 模型可见的工具</h3>
+<table>
+<tr><th>会话</th><th>工具</th><th>其余工具</th></tr>
+<tr><td>Router</td><td><code>dispatch</code> <code>message</code> <code>stop</code> <code>retry</code> <code>resume</code> <code>close</code> <code>list</code> <code>read</code> <code>projects</code></td><td>preset 里不放 shell / fs / web / subagent；setup 里再加一层 <code>tools.restrict({ allow })</code> 兜底</td></tr>
+<tr><td>Worker</td><td><code>superagent_report</code> <code>superagent_done</code></td><td>复制 <code>standard</code> preset（shell、fs、jobs、todo、原生提问……）。不再需要自定义 <code>ask</code>：用原生提问即可</td></tr>
+</table>
+
+<h2 id="arch">5. 架构</h2>
+<pre><code>DeepSeek Harness 宿主进程（desktop profile）
+├─ bundle: dsh-superagent
+│  ├─ host plugin  superagent           → 提供 ctx.superAgent
+│  │   store      storage-domain「superagent」（单写者）
+│  │   dispatcher ctx.agents.create({ meta:{cwd}, agentOptions, setup: mount worker preset })
+│  │              + workspaceRegistry.create(path).attachSession(id)
+│  │   observer   ctx.on('session/event') · agent/status · approval/request · user-questions/request
+│  │              （只看 Worker 会话，按 sessionId → ticket 映射）
+│  │   batcher    需人处理的事件入队 → Router 空闲且 1.5s 无新事件 → 一条 followup；忙则 inject
+│  │   watchdog   setInterval 3s：idle 且未 done → stalled；漏投递复查；启动时 interrupted 对账
+│  │   projection sessionProjections.register('superagent') 挂在 Router 会话上（S3 不通则改 ws 路由）
+│  ├─ preset  superagent-router   persona + Router 工具，无执行工具
+│  ├─ preset  superagent-worker   standard 的副本 + report/done + Worker 规则 persona
+│  └─ client  dsh.client          面板 · 行徽标 · band · /next · @12 认领
+└─ dsh 原生：会话日志、侧栏、审批弹窗、提问卡片、冷恢复、compaction
+</code></pre>
+
+<h3>5.1 一次派工的关键路径</h3>
+<ol>
+  <li>Router 调 <code>dispatch</code> → store 写 queued（同步）。</li>
+  <li>检查同项目占用与并发上限（同步，读内存）。</li>
+  <li><code>await ctx.agents.create(...)</code>：必须等。拿到 sessionId 后才能做映射和挂 Workspace。</li>
+  <li><code>workspaceRegistry.create(path)</code> 与「写 working + sessionId」可以并发；<code>attachSession</code> 等前者。</li>
+  <li><code>agent.followup(任务文本)</code>，立即返回给 Router。</li>
+</ol>
+<p class="muted">关键路径上只有两次串行等待：创建 agent（第 3 步，后续都依赖 sessionId），以及 attachSession（依赖 workspaceId）。其余全部并发或同步完成。</p>
+
+<h3>5.2 一次提问的往返</h3>
+<ol>
+  <li>Worker 调原生提问工具 → <code>user-questions/request</code> waterfall → 插件观察：奏折进入 asking，记一条 <code>ask</code> 事件，然后 <code>next()</code> 放行。</li>
+  <li>dsh 在 Worker 会话里画出提问卡片，侧栏行亮黄点（原生行为加插件徽标）。</li>
+  <li>batcher 把「#12 问：…（附此前最后一条进展）」注入 Router，Router 转述给你。</li>
+  <li>你点「单聊」或 <code>/next</code> 进入 Worker 会话，原地回答 → 插件观察到回答，奏折回到 working，往 Router <code>inject</code> 一行「你已回答 #12」。</li>
+</ol>
+
+<h2 id="pdf">6. PDF 六个模块在 dsh 里的落地</h2>
+<table>
+<tr><th>PDF</th><th>dsh 里的做法</th><th>分期</th></tr>
+<tr><td>§2 双层架构</td><td>Router = 无执行工具的根会话（轻模型）；Worker = 各项目目录里的根会话（强模型）。作用域用 preset 加 <code>agentCtx.tools.restrict</code> 实现，比 agentd 用钩子拦截更硬。</td><td>P1</td></tr>
+<tr><td>§2.1 批处理</td><td>batcher：Router idle 时 <code>followup</code> 一条合并消息；running 时 <code>inject</code>，下一步自动带上。<code>agent/status</code> 事件代替 agentd 的 2 秒轮询。</td><td>P1</td></tr>
+<tr><td>§3.1 两级过滤</td><td>Source 插件（GitHub 用 <code>gh</code> 轮询 PR、评论、CI；本地 git hook；日程）→ 程序层规则（来源、仓库、作者白名单）→ 候选事件给 Router 做语义判断。</td><td>P3</td></tr>
+<tr><td>§3.2 订阅直通</td><td>新增 <code>threads</code> 表（如 <code>github:owner/repo#123</code>）。Worker 派出时订阅，同 Thread 的后续事件直接 <code>steer</code> 给 Worker，Router 只收一行 inject。</td><td>P3</td></tr>
+<tr><td>§3.3 Inline &amp; Spill / 链式召回</td><td>事件 ≤300 字加奏折头，交回类事件附此前最后一条进展（agentd 偏差 45）。<code>read</code> 三跳：summary → events → transcript。transcript 用 <code>ctx.sessionQuery.readSession</code>，长内容存 <code>ctx.spillStore</code>。不用原生 session_query 工具：它要求 cwd 完全一致，跨项目读不了。</td><td>P1 / P2</td></tr>
+<tr><td>§3.4 投机执行</td><td>候选事件（如 issue、CI 红）在规则命中时静默派一张 <code>speculative</code> 奏折：只复现、只在 worktree 里改。有结果才通知 Router，否则悄悄关掉。</td><td>P4</td></tr>
+<tr><td>§4.1 异步 ReAct</td><td>dsh 原生已支持：Worker 的 <code>tool-jobs</code>，Router 侧的派工本身就是异步的。</td><td>现成</td></tr>
+<tr><td>§4.2 多信道</td><td>v1 只有 dsh 界面。P3 的 GitHub Source 同时作为输出信道：Router 按「PR 结构化、IM ≤100 字」的规范回写。</td><td>P3</td></tr>
+<tr><td>§5 存算分离 / BYOM</td><td>同一个 bundle 装进 headless 或 web profile，常驻跑在一台开发机上；桌面应用通过 web 访问。更远一步：仿照 <code>e2b</code> 的 <code>fs-*</code> 加 <code>subprocess-*</code> provider，写一个连到端侧 daemon 的执行世界。</td><td>P5（探索）</td></tr>
+<tr><td>§6 Watchdog</td><td>两层。程序层是 watchdog 定时器（stalled、漏投递、对账），P1 就有。LLM 层是一个独立的 Watchdog 会话，用 <code>ctx.schedule</code> 每 N 分钟唤醒，读所有 working 奏折的最近动作，判断是否原地打转或偏离目标，必要时 <code>message</code> 纠偏或通知 Router。</td><td>P1 / P4</td></tr>
+</table>
+
+<h2 id="vs">7. 相对 agentd：哪些绕法不再需要</h2>
+<table>
+<tr><th>agentd 的绕法</th><th>原因</th><th>dsh 里</th></tr>
+<tr><td>守护进程 + HTTP + 自举/过期/重启（偏差 12、16、27、42）</td><td>Claude Code 会话不在同一个进程</td><td>插件就在宿主进程里，删除</td></tr>
+<tr><td>Worker 侧 MCP 壳（偏差 6、7）</td><td>只能通过 MCP 给 Worker 加工具</td><td><code>agentCtx.tools.register</code>，删除</td></tr>
+<tr><td>claude agents 对账、pid 判存活（偏差 1、21）</td><td>拿不到会话句柄</td><td><code>AgentHandle</code> 加 <code>agent/status</code>，删除</td></tr>
+<tr><td>transcript 全目录搜索（偏差 3、44）</td><td>日志位置不可推算</td><td><code>sessionQuery</code> / <code>session/event</code>，删除</td></tr>
+<tr><td>权限钩子、grant、批准词（偏差 36–41）</td><td>auto 审查只认会话内的用户消息</td><td>原生审批加镜像（D3），删除</td></tr>
+<tr><td>单聊截流、<code>/say</code> 重启注入（偏差 31、41）</td><td>Worker 不好打开，转达的话不被认可</td><td>直接打开 Worker 会话（D2），删除</td></tr>
+<tr><td>iTerm2 attach（偏差 34、43）</td><td>VSCode 打开会另起一个进程</td><td><code>uiWorkspace.openSession</code>，删除</td></tr>
+<tr><td>注入被拒就排队（偏差 4）</td><td>引擎拒绝插件开新回合</td><td><code>followup</code> 总能唤醒，仍保留补投逻辑以防竞态（见 S5）</td></tr>
+</table>
+<p><b>保留并移植</b>：状态机、同项目串行、收即停、恢复与重试的区分、Inline 摘要加局部性、链式召回、压缩后重发总览（dsh 有 compaction 事件）、项目扫描去重、band 语义色。</p>
+
+<h2 id="risks">8. 风险与必须先做的 spike</h2>
+<div class="bad"><b>S2 是能否成立的关键</b>：dsh-agent README 写着 <code>handle.dispose()</code> 会「stops the loop, unregisters, <b>removes the session</b>」，而 HMR 重载或卸载插件时会销毁插件创建的 agent。要先弄清「remove」是只从内存注册表里移除，还是会删掉持久化的日志。如果会删日志，Worker 就不能由插件持有，改为 <code>ctx.sessionController.create()</code> 创建（会话归 controller 所有、跟 UI 新建会话一样）。那样一来，模型要靠 preset 固定，还得核实 preset 能不能指定模型。</div>
+<table>
+<tr><th>编号</th><th>验证什么</th><th>不成立时的退路</th></tr>
+<tr><td>S1</td><td>profile 插件 <code>ctx.agents.create({meta:{cwd}})</code> 加 <code>attachSession</code> 后，会话出现在对应 Workspace，能打开、能继续对话；重启应用后仍在，能冷恢复。</td><td>改用 <code>sessionController.create({cwd, workspaceId, agentPreset})</code></td></tr>
+<tr><td>S2</td><td>dispose 和 HMR 是否删除会话日志（见上）；重载后能否用 <code>sessionController.resolveAgent(id)</code> 重新拿到 Worker。</td><td>同 S1</td></tr>
+<tr><td>S3</td><td>第三方插件能否往 Router 会话 <code>append</code> 自定义事件类型并注册 projection（会话不变量：「模型可见即已记录」）。</td><td>面板改走 <code>webServer.registerUpgrade</code> 的 ws 推送（dsh-better-sidebar 的做法），并加 origin 校验</td></tr>
+<tr><td>S4</td><td>在 Worker 的 agentCtx 上 prepend 的 <code>approval/request</code> / <code>user-questions/request</code> 监听，只观察加 <code>next()</code> 时，原生 UI 是否照常工作；能否观察到「已回答」。</td><td>改为轮询 dsh 的「待交互」状态（侧栏黄点的数据源）</td></tr>
+<tr><td>S5</td><td>agent 正在退回 idle 时到达的 steer/inject 是否会搁浅（tool-jobs README 有记载）。</td><td>watchdog 每 3 秒复查：agent idle 但 inbox 非空，或有未送达事件，就补发 <code>followup</code></td></tr>
+<tr><td>S6</td><td>preset 行能否 inject 宿主插件提供的 <code>ctx.superAgent</code>；Router preset 去掉 shell/fs 后是否仍能正常启动（有没有隐式依赖）。</td><td>工具改在 setup 里注册，不进 preset</td></tr>
+</table>
+<div class="note"><b>接口稳定性</b>：dsh 是 0.2.1-rc.5 nightly，preset 刚从目录改成插件行，setup 签名也刚改过。bundle 要锁定一个 dsh 版本区间，启动时检查所需服务是否存在，缺了就明说，不要静默降级。</div>
+
+<h2 id="phases">9. 分期</h2>
+<ol>
+  <li><b>P0 · spike</b>（S1–S6）：结论记入 implementation-notes.md 的 dsh 一节。</li>
+  <li><b>P1 · 能派能收</b>：Router preset 加 9 个工具、Worker preset 加 report/done、storage-domain、状态机、batcher、程序层 watchdog、奏折主面板、band、行徽标、打开会话。</li>
+  <li><b>P2 · 人在回路</b>：提问和审批镜像（D3）、retry/resume/stop/close、interrupted 对账（D6）、链式召回 transcript 层、<code>@12</code> 认领、压缩后重发总览。</li>
+  <li><b>P3 · 事件驱动</b>：GitHub Source、两级过滤、Thread 订阅直通、GitHub 作为输出信道。</li>
+  <li><b>P4 · 主动</b>：LLM Watchdog 会话、投机执行。</li>
+  <li><b>P5 · 持久在线（探索）</b>：headless/web profile 常驻、端侧执行世界 provider、（D5）Claude Code executor。</li>
+</ol>
+
+<h2 id="mech">10. 机械部分（这部分你可以放心交给我）</h2>
+<ol>
+  <li><b>包结构</b>：<code>packages/dsh-superagent/</code>，内含 <code>package.json</code>（<code>dsh.bundle.patch</code> + <code>dsh.client</code>）、<code>cordis.patch.yml</code>（插入 host 插件和两个 preset 行）、<code>src/host/*</code>、<code>src/client/*</code>、<code>presets/*</code>。纯逻辑（状态机、摘要、批处理决策）放在包内的 <code>src/core/</code>，不依赖 dsh，单测覆盖；v2 时再上提为 <code>packages/core</code>。</li>
+  <li><b>构建</b>：tsdown 出 host ESM 和 client 的 Module Loader 格式，React 等从 loader 的 <code>require</code> 取，不打包进来。TypeScript、prettier（无分号）、eslint。</li>
+  <li><b>样式偏差</b>：你默认要 tailwind，但 dsh 规定插件 UI 用 CSS Modules 加 <code>--dsw-alias-*</code> 主题 token，不许用字面颜色。为了和明暗主题一致，这里遵守 dsh 的规定，记入偏差。</li>
+  <li><b>测试</b>：core 用 vitest 单测。host 用 dsh 的 test-support 起最小组合（mock LLM）做集成测试：派工 → report → done → Router 收到批量事件。client 只测纯函数（分组、配色、band 文案）。</li>
+  <li><b>安装</b>：开发期在 <code>~/.dsh/profiles/desktop/cordis.patch.yml</code> 里 <code>insert</code> 本地路径，打开 HMR <code>root</code> 指向源码目录。稳定后用 <code>dsh plugin --profile desktop add &lt;路径&gt;</code> 装成 bundle。卸载只需删掉这一层。</li>
+  <li><b>文档</b>：README.html 增加 dsh 一节；implementation-notes.md 增加「dsh」小节，记 spike 结论与偏差。</li>
+</ol>
+
+</body>
+</html>

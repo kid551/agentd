@@ -1,0 +1,6 @@
+pnpm-lock.yaml
+dist
+.spike
+**/.claude-plugin/types
+*.html
+packages/router-mod/daemon

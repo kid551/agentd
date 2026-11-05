@@ -1,0 +1,34 @@
+{
+  "name": "agentd-monorepo",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.33.0",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "pnpm -r --filter './packages/*' run build",
+    "typecheck": "pnpm -r --filter './packages/*' run typecheck",
+    "test": "vitest run",
+    "lint": "eslint .",
+    "fmt": "prettier --write .",
+    "fmt:check": "prettier --check .",
+    "check": "pnpm check:sensitive && pnpm typecheck && pnpm lint && pnpm test && pnpm build",
+    "check:sensitive": "node scripts/check-sensitive.mjs",
+    "prepare": "git config core.hooksPath .githooks || true",
+    "serve": "node packages/agentd/dist/agentd.mjs serve",
+    "daemon:restart": "node packages/router-mod/daemon/agentd.mjs restart",
+    "setup:router": "node scripts/setup-router.mjs",
+    "pack:share": "node scripts/pack-share.mjs"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^24.19.2",
+    "eslint": "^10.14.0",
+    "prettier": "^3.9.10",
+    "tsdown": "^0.23.4",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.72.1",
+    "vitest": "^5.1.0"
+  }
+}

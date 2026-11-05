@@ -1,0 +1,12 @@
+{
+  "name": "TerenceXie-agentd",
+  "description": "agentd：在一个 Claude Code 会话里派工给多个后台 Worker",
+  "owner": { "name": "TerenceXie" },
+  "plugins": [
+    {
+      "name": "agentd-router",
+      "source": "./packages/router-mod",
+      "description": "agentd 的 Router：在一个 Claude Code 会话里派工、批阅多个后台 Worker 的问题与交付"
+    }
+  ]
+}
