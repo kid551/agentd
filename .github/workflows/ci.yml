@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # This repository is public: nothing private gets in, hook or no hook (AGENTS.md).
+      - run: pnpm check:sensitive
+      - run: pnpm typecheck
+      - run: pnpm lint
+      - run: pnpm test
+      # Plugin users run the committed daemon/ as is; it must be what the sources build.
+      - run: pnpm build
+      - name: daemon/ is up to date
+        run: git diff --exit-code -- packages/router-mod/daemon
