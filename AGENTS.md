@@ -48,6 +48,14 @@ git config user.email "<id>+<login>@users.noreply.github.com"
 
 The pre-commit hook refuses any other address.
 
+Merging a PR on GitHub writes a new commit as your **GitHub account's** name and
+email, not the branch's: no hook sees it. Turn on Settings → Emails → "Keep my
+email addresses private" so that commit gets the noreply address too. CI checks
+the identities of every new commit on main and fails if a personal one got in.
+
+The PR title and body become the squash commit's message, so they follow section
+1 as well; CI scans them on every PR edit.
+
 ## 4. The check
 
 `pnpm install` points git at `.githooks/`, whose pre-commit runs

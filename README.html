@@ -300,8 +300,9 @@ claude plugin test .  # mod 的测试：引擎替身 + 假守护进程</code></p
   <li>git 远端主机，只放行 github.com、gitlab.com、bitbucket.org 和 example 域名；<code>*.ts.net</code>；私网 IP；</li>
   <li>文件名：<code>.env*</code>（<code>.env.example</code> 除外）、密钥文件、数据库文件、<code>implementation-notes.md</code>；</li>
   <li>提交人与作者的邮箱（<code>git var GIT_AUTHOR_IDENT</code>，环境变量覆盖也算）必须是 noreply 地址——它会随每个提交公开。</li>
+  <li><b>CI 里另有两步</b>（<code>.github/workflows/ci.yml</code>）：PR 的标题和描述按提交信息的规则扫（它们就是 squash 后的提交信息，PR 一改就重跑）；push 到 main 后用 <code>--commits &lt;before&gt;..&lt;sha&gt;</code> 查新提交的作者、提交人和提交信息。CI 里没有 <code>.sensitive-words</code>，只有通用规则。</li>
 </ul>
-<p><b>微妙之处</b>：规则只能写成通用的，因为把「我的公司名、内网主机名」写进脚本本身就是泄露。这类词一行一个放在仓库根的 <code>.sensitive-words</code>（被 gitignore），脚本运行时读入（在 worktree 里提交时也读主目录那份，agentd 的 Worker 就是在 worktree 里提交的）、不分大小写匹配。真要放行的一行加 <code>sensitive-check: allow</code> 注释。测试里的样例用字符串拼接，免得测试文件自己触发检查。<code>pnpm-lock.yaml</code> 不扫。</p>
+<p><b>微妙之处</b>：规则只能写成通用的，因为把「我的公司名、内网主机名」写进脚本本身就是泄露。这类词一行一个放在仓库根的 <code>.sensitive-words</code>（被 gitignore），脚本运行时读入（在 worktree 里提交时也读主目录那份，agentd 的 Worker 就是在 worktree 里提交的）、不分大小写匹配。真要放行的一行加 <code>sensitive-check: allow</code> 注释。<b>GitHub 上的 squash 合并不经过本地 hook</b>：合并提交由 GitHub 生成，作者取账号的资料名和主邮箱，跟分支上的提交无关，所以账号要开「Keep my email addresses private」，CI 那一步是事后的报警。测试里的样例用字符串拼接，免得测试文件自己触发检查。<code>pnpm-lock.yaml</code> 不扫。</p>
 
 <!-- ============================================================ -->
 <h2 id="ref">6. 参考</h2>

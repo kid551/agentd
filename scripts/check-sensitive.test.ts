@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   badFileName,
+  commitProblems,
   identityProblem,
   lineProblems,
   messageText,
@@ -81,5 +82,22 @@ describe('check-sensitive', () => {
       '@corp.io\n',
     )
     expect(messageText(raw)).toBe('subject\n\nbody\n')
+  })
+
+  it('reads a commit made elsewhere: GitHub squash merges use the account email', () => {
+    const noreply = j('1+me', '@users.noreply.github.com')
+    const ok = {
+      sha: 'abcdef0123',
+      author: noreply,
+      committer: j('noreply', '@github.com'),
+      message: 'fix (#2)',
+    }
+    expect(commitProblems(ok)).toEqual([])
+    expect(commitProblems({ ...ok, author: j('jdoe', '@gmail.com') })).toEqual([
+      { path: '(commit abcdef0)', line: 0, why: j('author jdoe', '@gmail.com') },
+    ])
+    expect(commitProblems({ ...ok, message: 'deploy to Zephyr' }, ['zephyr'])).toEqual([
+      { path: '(commit abcdef0)', line: 1, why: 'private word "zephyr"' },
+    ])
   })
 })

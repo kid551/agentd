@@ -2,6 +2,8 @@ name: CI
 
 on:
   pull_request:
+    # edited: the title and body become the squash commit's message, so check them again.
+    types: [opened, synchronize, reopened, edited]
   push:
     branches: [main]
 
@@ -14,6 +16,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - uses: pnpm/action-setup@v6
       - uses: actions/setup-node@v7
         with:
@@ -22,6 +26,23 @@ jobs:
       - run: pnpm install --frozen-lockfile
       # This repository is public: nothing private gets in, hook or no hook (AGENTS.md).
       - run: pnpm check:sensitive
+      - name: PR title and body (they become the squash commit message)
+        if: github.event_name == 'pull_request'
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          printf '%s\n\n%s\n' "$TITLE" "$BODY" > "$RUNNER_TEMP/pr-message"
+          node scripts/check-sensitive.mjs --message "$RUNNER_TEMP/pr-message"
+      # A squash merge is written by GitHub as the account's own name and email: no hook
+      # sees it. This turns main red if a personal address got in.
+      - name: identities and messages of the new commits on main
+        if: github.event_name == 'push'
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then range="$BEFORE..$GITHUB_SHA"; else range="$GITHUB_SHA^!"; fi
+          node scripts/check-sensitive.mjs --commits "$range"
       - run: pnpm typecheck
       - run: pnpm lint
       - run: pnpm test
