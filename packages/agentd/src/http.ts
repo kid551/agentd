@@ -4,7 +4,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 
 import type { Daemon } from './daemon.js'
 import type { ApplyResult } from './store.js'
-import type { Outcome } from './types.js'
+import type { Outcome, TicketView } from './types.js'
 
 type Handler = (req: Request) => Promise<Reply> | Reply
 type Request = { params: string[]; query: URLSearchParams; body: Record<string, unknown> }
@@ -71,6 +71,13 @@ const count = (query: URLSearchParams, key: string, fallback: number): number =>
   return Number.isInteger(n) && n > 0 ? Math.min(n, 500) : fallback
 }
 
+/** A non-negative integer cursor from the query; undefined when absent or not one. */
+const offset = (query: URLSearchParams, key: string): number | undefined => {
+  const raw = query.get(key)
+  const n = Number(raw)
+  return raw !== null && Number.isInteger(n) && n >= 0 ? n : undefined
+}
+
 /** A state change answers 200 with the ticket, or 409 with the reason it was refused. */
 const applied = (result: ApplyResult): Reply =>
   result.ok
@@ -113,6 +120,17 @@ export function routes(daemon: Daemon, shutdown?: () => void): [string, RegExp, 
     ['POST', /^\/projects\/rescan$/, () => ({ body: daemon.rescan() })],
     [
       'GET',
+      /^\/tickets\/search$/,
+      ({ query }) => ({
+        body: store.searchTickets({
+          query: query.get('q') ?? '',
+          project: query.get('project') ?? '',
+          limit: count(query, 'limit', 20),
+        }),
+      }),
+    ],
+    [
+      'GET',
       /^\/tickets$/,
       ({ query }) => {
         const filter = (query.get('state') ?? 'open') as 'open' | 'needs_me' | 'recent' | 'all'
@@ -123,11 +141,13 @@ export function routes(daemon: Daemon, shutdown?: () => void): [string, RegExp, 
       'POST',
       /^\/tickets$/,
       ({ body }) => {
+        const follows = Number(body.follows)
         const result = daemon.dispatch({
           project: str(body, 'project'),
           title: str(body, 'title'),
           prompt: str(body, 'prompt'),
           readonly: body.readonly === true,
+          ...(Number.isInteger(follows) && follows > 0 ? { follows } : {}),
           ...(typeof body.model === 'string' && body.model ? { model: body.model } : {}),
         })
         return result.ok ? { status: 201, body: result } : { status: 422, body: result }
@@ -139,24 +159,50 @@ export function routes(daemon: Daemon, shutdown?: () => void): [string, RegExp, 
       ({ params }) => {
         const ticket = store.ticket(id(params))
         if (!ticket) throw new HttpError(404, '没有这个 ticket')
-        return { body: { ...ticket, prompt: store.ticketPrompt(ticket.id) } }
+        const brief = (t: TicketView | null) =>
+          t && { id: t.id, title: t.title, project: t.project, state: t.state }
+        return {
+          body: {
+            ...ticket,
+            prompt: store.ticketPrompt(ticket.id),
+            follows: ticket.followsId === null ? null : brief(store.ticket(ticket.followsId)),
+            followers: store.followersOf(ticket.id).map(brief),
+          },
+        }
       },
     ],
     [
       'GET',
       /^\/tickets\/(\d+)\/events$/,
-      ({ params, query }) => ({
-        body: store.eventsOf(id(params), count(query, 'limit', 50)),
-      }),
+      ({ params, query }) => {
+        // One more than asked says whether older events remain.
+        const limit = count(query, 'limit', 50)
+        const page = store.eventsOf(id(params), limit + 1, offset(query, 'before'))
+        const more = page.length > limit
+        return { body: { events: more ? page.slice(1) : page, more } }
+      },
     ],
     ['GET', /^\/activity$/, () => ({ body: daemon.activity() })],
     [
       'GET',
       /^\/tickets\/(\d+)\/transcript$/,
       ({ params, query }) => {
-        const rows = daemon.transcript(id(params), count(query, 'tail', 20))
-        if (!rows) throw new HttpError(404, '还找不到这个 Worker 的会话记录')
-        return { body: rows }
+        const page = daemon.transcript(
+          id(params),
+          count(query, 'tail', 20),
+          offset(query, 'before'),
+        )
+        if (!page) throw new HttpError(404, '还找不到这个 Worker 的会话记录')
+        return { body: page }
+      },
+    ],
+    [
+      'GET',
+      /^\/tickets\/(\d+)\/transcript\/(\d+)$/,
+      ({ params }) => {
+        const row = daemon.transcriptRow(id(params), Number(params[1]))
+        if (!row) throw new HttpError(404, '这个 Worker 的会话记录里没有从这里开始的一条')
+        return { body: row }
       },
     ],
     [

@@ -1,4 +1,4 @@
-import { mkdtempSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -117,7 +117,8 @@ describe('HTTP API and the Worker MCP server, end to end', () => {
     const closed = await client.post<{ ok: boolean; ticket: TicketView }>('/tickets/1/close')
     expect(closed.data.ticket.state).toBe('done')
 
-    const kinds = (await client.get<{ kind: string }[]>('/tickets/1/events')).data.map(e => e.kind)
+    const page = await client.get<{ events: { kind: string }[] }>('/tickets/1/events')
+    const kinds = page.data.events.map(e => e.kind)
     expect(kinds).toEqual(['dispatched', 'spawned', 'progress', 'ask', 'answer', 'ready', 'closed'])
   })
 
@@ -150,9 +151,93 @@ describe('HTTP API and the Worker MCP server, end to end', () => {
     })
     expect(early.status).toBe(409)
     // A row count that is not a number falls back instead of reaching SQL.
-    const events = await client.get<{ kind: string }[]>('/tickets/1/events?limit=abc')
+    const events = await client.get<{ events: unknown[] }>('/tickets/1/events?limit=abc')
     expect(events.status).toBe(200)
-    expect(events.data.length).toBeGreaterThan(0)
+    expect(events.data.events.length).toBeGreaterThan(0)
+  })
+
+  test('recall: a follow-up links both ways, search finds it, events and transcript page back', async () => {
+    const { client, daemon } = await up()
+    await client.post('/tickets', { project: 'memos', title: '修登录', prompt: '登录重试改成退避' })
+    const next = await client.post<{ ok: boolean; ticket: TicketView; note?: string }>('/tickets', {
+      project: 'memos',
+      title: '修登录第二轮',
+      prompt: '接着改',
+      follows: 1,
+    })
+    expect(next.data.ticket.followsId).toBe(1)
+    expect(next.data.note).toBeUndefined()
+    const slip = await client.post<{ ok: boolean; ticket: TicketView; note?: string }>('/tickets', {
+      project: 'memos',
+      title: '别的',
+      prompt: 'p',
+      follows: 99,
+    })
+    expect(slip.data.ok).toBe(true)
+    expect(slip.data.ticket.followsId).toBeNull()
+    expect(slip.data.note).toContain('没有 ticket #99')
+
+    type Brief = { id: number; title: string; state: string }
+    const first = await client.get<{ follows: Brief | null; followers: Brief[] }>('/tickets/1')
+    expect(first.data.follows).toBeNull()
+    expect(first.data.followers).toMatchObject([{ id: 2, title: '修登录第二轮' }])
+    const second = await client.get<{ follows: Brief | null }>('/tickets/2')
+    expect(second.data.follows).toMatchObject({ id: 1, title: '修登录' })
+
+    const found = await client.get<TicketView[]>(`/tickets/search?q=${encodeURIComponent('登录')}`)
+    expect(found.data.map(t => t.id)).toEqual([2, 1])
+
+    await settle(daemon)
+    for (const summary of ['一', '二', '三']) await client.post('/tickets/1/report', { summary })
+    const last = await client.get<{ events: { id: number; kind: string }[]; more: boolean }>(
+      '/tickets/1/events?limit=2',
+    )
+    expect(last.data.more).toBe(true)
+    const older = await client.get<{ events: { kind: string }[]; more: boolean }>(
+      `/tickets/1/events?limit=10&before=${last.data.events[0]!.id}`,
+    )
+    expect(older.data).toEqual({
+      events: [
+        expect.objectContaining({ kind: 'dispatched' }),
+        expect.objectContaining({ kind: 'spawned' }),
+        expect.objectContaining({ kind: 'progress' }),
+      ],
+      more: false,
+    })
+
+    const home = mkdtempSync(join(tmpdir(), 'agentd-home-'))
+    const folder = join(home, 'projects', '-r-memos')
+    mkdirSync(folder, { recursive: true })
+    const sessionId = (await client.get<TicketView>('/tickets/1')).data.workerSessionId as string
+    const long = '长'.repeat(700)
+    writeFileSync(
+      join(folder, `${sessionId}.jsonl`),
+      [
+        { type: 'user', message: { content: '开始' } },
+        { type: 'assistant', message: { content: [{ type: 'text', text: long }] } },
+      ]
+        .map(r => JSON.stringify(r))
+        .join('\n') + '\n',
+    )
+    const saved = process.env.CLAUDE_CONFIG_DIR
+    process.env.CLAUDE_CONFIG_DIR = home
+    try {
+      type Row = { text: string; at: number; isCut: boolean }
+      const page = await client.get<{ rows: Row[]; more: boolean }>('/tickets/1/transcript?tail=1')
+      expect(page.data.more).toBe(true)
+      const row = page.data.rows[0]!
+      expect(row.isCut).toBe(true)
+      const whole = await client.get<Row>(`/tickets/1/transcript/${row.at}`)
+      expect(whole.data.text).toBe(long)
+      expect((await client.get(`/tickets/1/transcript/${row.at + 1}`)).status).toBe(404)
+      const before = await client.get<{ rows: Row[]; more: boolean }>(
+        `/tickets/1/transcript?tail=5&before=${row.at}`,
+      )
+      expect(before.data).toMatchObject({ rows: [{ text: '开始' }], more: false })
+    } finally {
+      if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR
+      else process.env.CLAUDE_CONFIG_DIR = saved
+    }
   })
 
   test('mr_consent answers from what agentd recorded, never from the words in the session', async () => {

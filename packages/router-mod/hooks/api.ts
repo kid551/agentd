@@ -23,6 +23,9 @@ export type Ticket = {
   worktree?: boolean
   branch?: string | null
   mrOpened?: boolean
+  /** Absent from daemons older than follow-ups. */
+  followsId?: number | null
+  endedAt?: number | null
   openQuestion: {
     id: number
     kind?: 'ask' | 'permission'

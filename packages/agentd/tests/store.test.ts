@@ -377,7 +377,8 @@ describe('Store', () => {
     a.apply(1, 'spawn_ok', 'agentd')
     a.ask(1, '哪个？', null)
     // Roll the database back to version 2, as an older agentd left it.
-    a.db.exec(`ALTER TABLE questions DROP COLUMN kind; ALTER TABLE questions DROP COLUMN grant_key;
+    a.db
+      .exec(`${DROP_FOLLOWS} ALTER TABLE questions DROP COLUMN kind; ALTER TABLE questions DROP COLUMN grant_key;
                ${V4_COLUMNS.map(c => `ALTER TABLE tickets DROP COLUMN ${c};`).join(' ')}
                PRAGMA user_version = 2;`)
     a.close()
@@ -391,7 +392,8 @@ describe('Store', () => {
     const a = new Store(join(dir, 'a.db'))
     a.replaceProjects([project])
     a.createTicket({ title: 't', project, prompt: 'p', model: 'opus', worktree: false })
-    a.db.exec(`${V4_COLUMNS.map(c => `ALTER TABLE tickets DROP COLUMN ${c};`).join(' ')}
+    a.db
+      .exec(`${DROP_FOLLOWS} ${V4_COLUMNS.map(c => `ALTER TABLE tickets DROP COLUMN ${c};`).join(' ')}
                PRAGMA user_version = 3;`)
     a.close()
     const b = new Store(join(dir, 'a.db'))
@@ -410,10 +412,32 @@ describe('Store', () => {
     const a = new Store(join(dir, 'a.db'))
     a.replaceProjects([project])
     a.createTicket({ title: 't', project, prompt: 'p', model: 'opus', worktree: false })
-    a.db.exec('ALTER TABLE tickets DROP COLUMN last_answer; PRAGMA user_version = 4;')
+    a.db.exec(
+      `${DROP_FOLLOWS} ALTER TABLE tickets DROP COLUMN last_answer; PRAGMA user_version = 4;`,
+    )
     a.close()
     const b = new Store(join(dir, 'a.db'))
     expect(b.ticket(1)?.lastAnswer).toBeNull()
+  })
+
+  test('a ticket from before follows reads as following none, and can be followed', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'agentd-store-'))
+    const a = new Store(join(dir, 'a.db'))
+    a.replaceProjects([project])
+    a.createTicket({ title: 't', project, prompt: 'p', model: 'opus', worktree: false })
+    a.db.exec(`${DROP_FOLLOWS} PRAGMA user_version = 5;`)
+    a.close()
+    const b = new Store(join(dir, 'a.db'))
+    expect(b.ticket(1)?.followsId).toBeNull()
+    b.createTicket({
+      title: 'u',
+      project,
+      prompt: 'p',
+      model: 'opus',
+      worktree: false,
+      followsId: 1,
+    })
+    expect(b.followersOf(1).map(t => t.id)).toEqual([2])
   })
 
   test('a permission question keeps its kind and grant key', () => {
@@ -426,7 +450,10 @@ describe('Store', () => {
   })
 })
 
-/** Columns added from version 4 on, dropped to roll a database back to version 3. */
+/** Rolls `follows_id` (version 6) back, before any older column goes. */
+const DROP_FOLLOWS = 'DROP INDEX tickets_follows; ALTER TABLE tickets DROP COLUMN follows_id;'
+
+/** Columns added from version 4 to 5, dropped to roll a database back to version 3. */
 const V4_COLUMNS = [
   'readonly',
   'branch',
@@ -439,4 +466,69 @@ const V4_COLUMNS = [
 test('cut keeps short text and flattens whitespace', () => {
   expect(cut(' a \n b ', 10)).toEqual({ text: 'a b', isCut: false })
   expect(cut('abcdef', 4)).toEqual({ text: 'abc…', isCut: true })
+})
+
+describe('recall', () => {
+  const make = (
+    store: Store,
+    title: string,
+    extra: { followsId?: number; project?: typeof project } = {},
+  ) =>
+    store.createTicket({
+      title,
+      project: extra.project ?? project,
+      prompt: `任务：${title}`,
+      model: 'opus',
+      worktree: false,
+      ...(extra.followsId === undefined ? {} : { followsId: extra.followsId }),
+    }).id
+
+  test('a follow-up names the ticket it carries on, and that ticket lists its followers', () => {
+    const store = fresh()
+    const a = make(store, '登录重试')
+    const b = make(store, '登录重试第二轮', { followsId: a })
+    const c = make(store, '登录重试补测试', { followsId: a })
+    expect(store.ticket(b)?.followsId).toBe(a)
+    expect(store.ticket(a)?.followsId).toBeNull()
+    expect(store.followersOf(a).map(t => t.id)).toEqual([b, c])
+    expect(store.followersOf(b)).toEqual([])
+  })
+
+  test('search finds ended tickets too, by title, task or latest message, newest first', () => {
+    const store = fresh()
+    const other = { id: 'acme-flutter', path: '/r/acme-flutter', root: '/r' }
+    store.replaceProjects([project, other])
+    const a = make(store, '修登录')
+    make(store, '加导出', { project: other })
+    const c = make(store, '改样式')
+    store.apply(c, 'spawn_ok', 'agentd')
+    store.apply(c, 'report', 'worker', { text: '顺手把登录页的按钮也改了' })
+    store.apply(a, 'close', 'you')
+    expect(store.searchTickets({ query: '登录' }).map(t => t.id)).toEqual([c, a])
+    expect(store.searchTickets({ query: '登录', limit: 1 }).map(t => t.id)).toEqual([c])
+    expect(store.searchTickets({ project: 'flutter' }).map(t => t.title)).toEqual(['加导出'])
+    expect(store.searchTickets({ query: '登录', project: 'flutter' })).toEqual([])
+    expect(store.searchTickets({}).map(t => t.id)).toEqual([3, 2, 1])
+  })
+
+  test('search takes % and _ as plain characters', () => {
+    const store = fresh()
+    make(store, '覆盖率到 80%')
+    make(store, '改 snake_case')
+    make(store, '别的')
+    expect(store.searchTickets({ query: '%' }).map(t => t.title)).toEqual(['覆盖率到 80%'])
+    expect(store.searchTickets({ query: 'e_c' }).map(t => t.title)).toEqual(['改 snake_case'])
+  })
+
+  test('events page back from before an event id', () => {
+    const store = fresh()
+    const id = make(store, 't')
+    store.apply(id, 'spawn_ok', 'agentd')
+    for (const text of ['一', '二', '三']) store.apply(id, 'report', 'worker', { text })
+    const last = store.eventsOf(id, 2)
+    expect(last.map(e => e.body.text)).toEqual(['二', '三'])
+    const older = store.eventsOf(id, 2, last[0]!.id)
+    expect(older.map(e => e.kind)).toEqual(['spawned', 'progress'])
+    expect(older.map(e => e.body.text)).toEqual([undefined, '一'])
+  })
 })

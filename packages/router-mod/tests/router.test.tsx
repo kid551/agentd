@@ -1,5 +1,5 @@
 import type { On } from 'claude-code'
-import { expect, mock, test } from 'claude-code/testing'
+import { expect, mock, test, type Engine } from 'claude-code/testing'
 import { lite } from '../hooks/api'
 import {
   ago,
@@ -54,7 +54,22 @@ const working: TicketFixture = {
   openQuestion: null,
 }
 
-function fakeDaemon(on: On, tickets: TicketFixture[], activity: () => unknown[] = () => []) {
+/** What the recall routes answer, for the tests that read along the chain. */
+type Recall = {
+  prompt?: string
+  links?: Record<number, { follows: unknown; followers: unknown[] }>
+  events?: unknown
+  transcript?: unknown
+  row?: unknown
+  found?: unknown[]
+}
+
+function fakeDaemon(
+  on: On,
+  tickets: TicketFixture[],
+  activity: () => unknown[] = () => [],
+  recall: Recall = {},
+) {
   const calls: Call[] = []
   on('http.fetch', (_, e) => {
     const url = new URL(e.url)
@@ -92,10 +107,17 @@ function fakeDaemon(on: On, tickets: TicketFixture[], activity: () => unknown[] 
         workerName: t?.workerName,
       })
     }
+    if (path === '/tickets/search') return reply(recall.found ?? [])
     if (/^\/tickets\/\d+$/.test(path) && method === 'GET') {
       const t = tickets.find(x => `/tickets/${String(x.id)}` === path)
-      return t ? reply({ ...t, prompt: '原任务' }) : reply({ ok: false, reason: '没有' }, 404)
+      const links = t ? recall.links?.[t.id as number] : undefined
+      return t
+        ? reply({ ...t, prompt: recall.prompt ?? '原任务', ...links })
+        : reply({ ok: false, reason: '没有' }, 404)
     }
+    if (/^\/tickets\/\d+\/events$/.test(path)) return reply(recall.events ?? [])
+    if (/^\/tickets\/\d+\/transcript\/\d+$/.test(path)) return reply(recall.row ?? {})
+    if (/^\/tickets\/\d+\/transcript$/.test(path)) return reply(recall.transcript ?? [])
     if (/^\/tickets\/\d+\/(message|say)$/.test(path)) return reply({ ok: true, ticket: working })
     if (/^\/tickets\/\d+\/(retry|resume|stop|close|open_mr|open_mr\/undo)$/.test(path)) {
       return reply({ ok: true, ticket: working })
@@ -218,6 +240,7 @@ test('the Router registers its tools and commands', async ($, on) => {
       'dispatch',
       'status',
       'read',
+      'find',
       'answer',
       'message',
       'close',
@@ -1042,9 +1065,7 @@ test('the pane colors: a state its own, a project always the same', () => {
   expect(stateLook('asking').color).toBe('warning')
   expect(stateLook('ready').glyph).toBe('✓')
   expect(projectColor('acme-flutter')).toBe(projectColor('acme-flutter'))
-  const colors = new Set(
-    ['memos', 'acme-flutter', 'acme-compute', 'agentd'].map(projectColor),
-  )
+  const colors = new Set(['memos', 'acme-flutter', 'acme-compute', 'agentd'].map(projectColor))
   expect(colors.size).toBeGreaterThan(1)
   for (const c of colors) expect(c).toMatch(/^#[0-9A-F]{6}$/)
 })
@@ -1695,4 +1716,133 @@ test('a card weighs its controls: the one press its state asks for, the ways in,
     expect(await ui.find({ key })).toMatchObject({ type: 'Markdown', props: { dimColor: true } })
   }
   await ui.unmount()
+})
+
+const readTool = async (
+  $: Engine,
+  input: { ticket: number; what?: string; limit?: number; before?: number; row?: number },
+): Promise<string> =>
+  String((await $.tool.call({ tool: 'mcp__agentd-router__read', ...input })).result)
+
+test('read summary links the ticket it carries on and the ones carrying it on, and cuts a long task', async ($, on) => {
+  engine(on)
+  const long = '把登录重试改成指数退避。'.repeat(150)
+  fakeDaemon(
+    on,
+    [working, { ...working, id: 5, title: '登录重试第二轮', project: 'memos' }],
+    undefined,
+    {
+      prompt: long,
+      links: {
+        5: {
+          follows: { id: 2, title: '补 ETL 单测', project: 'acme-compute', state: 'done' },
+          followers: [{ id: 6, title: '补测试', project: 'memos', state: 'working' }],
+        },
+      },
+    },
+  )
+  await start($)
+  const five = await readTool($, { ticket: 5 })
+  expect(five).toContain('接续自：#2 · acme-compute · 补 ETL 单测（已结束）')
+  expect(five).toContain('后续：#6 · memos · 补测试（在干）')
+  expect(five).toContain(`（共 ${long.length} 字，已截断，read ticket=5 what=prompt 取全文）`)
+  expect(five).not.toContain(long)
+  expect(await readTool($, { ticket: 5, what: 'prompt' })).toBe(long)
+  // A ticket in no chain says nothing of one.
+  expect(await readTool($, { ticket: 2 })).not.toMatch(/接续自|后续/)
+})
+
+test('read events and transcript say how to go further back and how to read a cut row', async ($, on) => {
+  engine(on)
+  const calls = fakeDaemon(on, [working], undefined, {
+    events: {
+      events: [
+        { id: 41, kind: 'progress', actor: 'worker', body: { text: '改完一处' } },
+        { id: 42, kind: 'ready', actor: 'worker', body: { text: '好了' } },
+      ],
+      more: true,
+    },
+    transcript: {
+      rows: [
+        { role: 'user', text: '开始', tools: [], at: 100, isCut: false },
+        { role: 'assistant', text: '长长的', tools: ['Edit'], at: 900, isCut: true },
+      ],
+      more: true,
+    },
+    row: { role: 'assistant', text: '长长的全文', tools: ['Edit'], at: 900, isCut: false },
+  })
+  await start($)
+  const events = await readTool($, { ticket: 2, what: 'events', limit: 2 })
+  expect(events.split('\n')[0]).toBe('（更早还有：read ticket=2 what=events before=41）')
+  expect(events).toContain('ready（worker）：好了')
+  await readTool($, { ticket: 2, what: 'events', before: 41 })
+  expect(calls.at(-1)?.path).toBe('/tickets/2/events?limit=20&before=41')
+
+  const tail = await readTool($, { ticket: 2, what: 'transcript' })
+  expect(tail.split('\n')[0]).toBe('（更早还有：read ticket=2 what=transcript before=100）')
+  expect(tail).toContain(
+    'assistant [Edit]：长长的…（已截断，read ticket=2 what=transcript row=900 取全文）',
+  )
+  const whole = await readTool($, { ticket: 2, what: 'transcript', row: 900 })
+  expect(calls.at(-1)?.path).toBe('/tickets/2/transcript/900')
+  expect(whole).toBe('assistant [Edit]：长长的全文')
+})
+
+test('read events and transcript from a daemon older than paging still read', async ($, on) => {
+  engine(on)
+  fakeDaemon(on, [working], undefined, {
+    events: [{ id: 1, kind: 'dispatched', actor: 'router', body: { text: 'p' } }],
+    transcript: [{ role: 'user', text: '开始', tools: [] }],
+  })
+  await start($)
+  expect(await readTool($, { ticket: 2, what: 'events' })).toBe('dispatched（router）：p')
+  expect(await readTool($, { ticket: 2, what: 'transcript' })).toBe('user：开始')
+})
+
+test('find asks the daemon by word and project, and lists ended tickets with their day', async ($, on) => {
+  engine(on)
+  const ended = new Date(2026, 10, 3, 15).getTime()
+  const calls = fakeDaemon(on, [], undefined, {
+    found: [
+      { ...working, id: 9, title: '登录第二轮', project: 'memos', followsId: 4 },
+      {
+        ...working,
+        id: 4,
+        title: '修登录',
+        project: 'memos',
+        state: 'done',
+        endedAt: ended,
+        lastReport: '已合入',
+      },
+    ],
+  })
+  await start($)
+  const text = String(
+    (await $.tool.call({ tool: 'mcp__agentd-router__find', query: ' 登录 ', project: 'memos' }))
+      .result,
+  )
+  expect(calls.at(-1)?.path).toBe(`/tickets/search?q=${encodeURIComponent('登录')}&project=memos`)
+  expect(text.split('\n')).toEqual([
+    '#9 · memos · 登录第二轮（在干） · 接续 #4 · 定位到 itemExtent',
+    '#4 · memos · 修登录（已结束 · 11月3日结束） · 已合入',
+  ])
+})
+
+test('dispatch carries follows to the daemon only when it is a ticket number', async ($, on) => {
+  engine(on)
+  const calls = fakeDaemon(on, [])
+  await start($)
+  const send = (extra: Record<string, unknown>) =>
+    $.tool.call({
+      tool: 'mcp__agentd-router__dispatch',
+      project: 'memos',
+      title: 't',
+      prompt: 'p',
+      ...extra,
+    })
+  await send({ follows: 4 })
+  await send({ follows: '四' })
+  const posts = calls.filter(c => c.method === 'POST' && c.path === '/tickets')
+  expect(posts[0]?.body).toMatchObject({ follows: 4 })
+  expect(posts[1]?.body).not.toHaveProperty('follows')
 })

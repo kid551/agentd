@@ -65,6 +65,11 @@ const fail = (text: string): Result => ({ ok: false, text })
 
 export type Activity = { lines: string[]; at: number }
 
+/** A ticket's task shows this long in read summary; depth=task gives it whole. */
+const TASK_CHARS = 1200
+/** A transcript line shows this long; row=N gives it whole. */
+const ROW_CHARS = 600
+
 /**
  * The Super-agent's business logic: dispatching, routing, the Worker callbacks,
  * the watchdog and the Router batching. It owns no dsh object; everything
@@ -110,6 +115,7 @@ export class SuperAgentService {
     task: string
     project: string
     readonly?: boolean
+    follows?: number
   }): Promise<Result> {
     const found = resolveProject(input.project, this.projects())
     if (found.kind === 'ambiguous') {
@@ -126,6 +132,10 @@ export class SuperAgentService {
         `没有找到项目「${input.project}」。${hint}请问用户，或调 superagent_projects 查看。`,
       )
     }
+    // A follows naming no ticket is a slip in the Router's recall: the task
+    // itself is fine, so it goes out without the link and the Router is told.
+    const follows =
+      input.follows !== undefined && this.board.get(input.follows) ? input.follows : undefined
     const ticket = await this.board.create({
       title: input.title.trim().slice(0, 60),
       task: input.task,
@@ -138,6 +148,7 @@ export class SuperAgentService {
         matchDelivery(this.config.projects, this.config.defaultDelivery, found.project.path) ===
           'mr',
       ...(input.readonly === true ? { readonly: true } : {}),
+      ...(follows === undefined ? {} : { follows }),
     })
     await this.launchQueued()
     const now = this.board.get(ticket.id) ?? ticket
@@ -151,7 +162,11 @@ export class SuperAgentService {
       now.state === 'queued' ? '排队中（同项目已有 Worker 或并发已满）' : STATE_WORDS[now.state]
     const how =
       now.readonly === true ? '，只读' : now.worktree ? '，MR 奏折：在自己的 worktree 里做' : ''
-    return ok(`已派 ${header(now)}，${where}${how}。`)
+    const slip =
+      input.follows !== undefined && follows === undefined
+        ? `没有奏折 #${input.follows}，没记接续关系。`
+        : ''
+    return ok(`已派 ${header(now)}，${where}${how}。${slip}`)
   }
 
   async message(id: number, text: string): Promise<Result> {
@@ -333,34 +348,90 @@ export class SuperAgentService {
     return scope === 'all' ? all : all.filter(t => !ENDED.includes(t.state) || this.recent(t))
   }
 
-  /** Chain of recall: summary → events → the Worker's conversation tail. */
-  async read(id: number, depth: 'summary' | 'events' | 'transcript'): Promise<Result> {
+  /**
+   * Tickets ended or not, newest first: those whose title, task or latest
+   * message holds `query`, in a project whose name holds `project`.
+   */
+  find(filter: { query?: string; project?: string; limit?: number }): Ticket[] {
+    const query = filter.query?.trim().toLowerCase() ?? ''
+    const project = filter.project?.trim().toLowerCase() ?? ''
+    const holds = (t: Ticket): boolean =>
+      [t.title, t.task, t.lastReport ?? ''].some(s => s.toLowerCase().includes(query))
+    return this.board
+      .list()
+      .filter(t => holds(t) && t.project.toLowerCase().includes(project))
+      .reverse()
+      .slice(0, Math.max(1, Math.min(filter.limit ?? 20, 100)))
+  }
+
+  /**
+   * Chain of recall: summary → task / events → the Worker's conversation. Each
+   * cut part says how to read the rest, and the summary names the tickets it
+   * links to, so the Router follows the chain by what it reads.
+   */
+  async read(
+    id: number,
+    depth: 'summary' | 'task' | 'events' | 'transcript',
+    page: { limit?: number; before?: number; row?: number } = {},
+  ): Promise<Result> {
     const t = this.board.get(id)
     if (t === undefined) return fail(`没有奏折 #${id}`)
+    const call = (args: string): string => `superagent_read id=${id} ${args}`
     if (depth === 'summary') {
+      const task = cut(t.task, TASK_CHARS)
       const lines = [
         `${header(t)}（${STATE_WORDS[t.state]}）`,
         `目录：${t.worktreePath ?? t.projectPath}${t.branch ? `（worktree，分支 ${t.branch}）` : ''}${t.readonly === true ? '（只读）' : ''}`,
-        `任务：${cut(t.task, 1200).text}`,
+        `任务：${task.text}${task.isCut ? `（共 ${t.task.length} 字，已截断，${call('depth=task')} 取全文）` : ''}`,
       ]
       if (t.pending) lines.push(`在等你：${t.pending.summary}`)
       // A pending question is the latest message while it waits: say it once.
       if (t.lastReport && t.lastReport !== t.pending?.summary)
         lines.push(`最近消息：${t.lastReport}`)
-      lines.push('更多：depth=events 看事件全文，depth=transcript 看 Worker 会话尾部。')
+      const from = t.follows === undefined ? undefined : this.board.get(t.follows)
+      if (from) lines.push(`接续自：${header(from)}（${STATE_WORDS[from.state]}）`)
+      const next = this.board.list().filter(f => f.follows === id)
+      if (next.length > 0)
+        lines.push(`后续：${next.map(f => `${header(f)}（${STATE_WORDS[f.state]}）`).join('；')}`)
+      lines.push(
+        '更多：depth=events 看事件全文，depth=transcript 看 Worker 会话；接续的奏折用 superagent_read 读它的号。',
+      )
       return ok(lines.join('\n'))
     }
+    if (depth === 'task') return ok(t.task)
     if (depth === 'events') {
-      const lines = this.board
+      const limit = page.limit ?? 50
+      const older = this.board
         .eventsOf(id)
-        .map(
-          e =>
-            `${new Date(e.at).toLocaleString('zh-CN')} ${e.actor} ${e.kind}${e.body ? `：${e.body}` : ''}`,
-        )
+        .filter(e => page.before === undefined || e.id < page.before)
+      const shown = older.slice(-limit)
+      const lines = shown.map(
+        e =>
+          `${new Date(e.at).toLocaleString('zh-CN')} ${e.actor} ${e.kind}${e.body ? `：${e.body}` : ''}`,
+      )
+      const first = shown[0]
+      if (first && older.length > shown.length)
+        lines.unshift(`（更早还有：${call(`depth=events before=${first.id}`)}）`)
       return ok(lines.join('\n') || '没有事件。')
     }
     if (t.sessionId === undefined) return fail(`${header(t)} 还没有 Worker 会话。`)
-    return ok(await this.workers.transcript(t.sessionId, 6000))
+    const all = await this.workers.transcript(t.sessionId)
+    if (all === undefined) return fail(`${header(t)} 的 Worker 会话打不开。`)
+    const line = (i: number, whole: boolean): string => {
+      const l = all[i] as { role: string; text: string }
+      if (whole || l.text.length <= ROW_CHARS) return `${l.role}: ${l.text}`
+      return `${l.role}: ${l.text.slice(0, ROW_CHARS)}…（已截断，${call(`depth=transcript row=${i}`)} 取全文）`
+    }
+    if (page.row !== undefined) {
+      return page.row >= 0 && page.row < all.length
+        ? ok(line(page.row, true))
+        : fail(`${header(t)} 的会话里没有第 ${page.row} 条。`)
+    }
+    const end = Math.min(page.before ?? all.length, all.length)
+    const start = Math.max(0, end - (page.limit ?? 20))
+    const lines = Array.from({ length: end - start }, (_, k) => line(start + k, false))
+    if (start > 0) lines.unshift(`（更早还有：${call(`depth=transcript before=${start}`)}）`)
+    return ok(lines.join('\n') || '会话是空的。')
   }
 
   // ── Worker-facing callbacks ─────────────────────────────────────────────

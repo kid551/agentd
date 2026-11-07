@@ -125,6 +125,8 @@ export type TicketView = {
    * cut; 批准 / 拒绝 for a permission request. Shown as 「你答：」 under it.
    */
   lastAnswer: string | null
+  /** The earlier ticket this one carries on, as the Router said at dispatch. */
+  followsId: number | null
   openQuestion: Question | null
   createdAt: number
   updatedAt: number
@@ -158,6 +160,8 @@ export type DispatchInput = {
   prompt: string
   readonly?: boolean
   model?: string
+  /** The earlier ticket this one carries on. */
+  follows?: number
 }
 
 export type ResolveResult =
@@ -167,4 +171,15 @@ export type ResolveResult =
 
 export type AnswerResult = { questionId: number; hadWaiter: boolean; workerName: string }
 
-export type TranscriptRow = { role: 'user' | 'assistant'; text: string; tools: string[] }
+export type TranscriptRow = {
+  role: 'user' | 'assistant'
+  text: string
+  tools: string[]
+  /** The row's byte offset in the transcript file: its id, for reading it whole or paging before it. */
+  at: number
+  /** True when `text` is cut to the per-row budget. */
+  isCut: boolean
+}
+
+/** Rows of a transcript, oldest first; `more` when older rows exist. */
+export type TranscriptPage = { rows: TranscriptRow[]; more: boolean }

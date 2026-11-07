@@ -18,9 +18,14 @@ export interface WorkerRuntime {
   /** Stops the current turn, keeping the Session. */
   cancel(sessionId: string): Promise<void>
   status(sessionId: string): Liveness
-  /** The tail of the Worker's conversation, for chain-of-recall reads. */
-  transcript(sessionId: string, maxChars: number): Promise<string>
+  /**
+   * The Worker's conversation as lines (a text block or a tool call each),
+   * oldest first, for chain-of-recall reads; undefined when it cannot be opened.
+   */
+  transcript(sessionId: string): Promise<TranscriptLine[] | undefined>
 }
+
+export type TranscriptLine = { role: string; text: string }
 
 export interface RouterLink {
   /** The Router Session id, creating the Session on first use. */

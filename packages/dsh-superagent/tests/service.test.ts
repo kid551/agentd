@@ -6,7 +6,13 @@ import { beforeEach, describe, expect, it } from 'vitest'
 
 import { FakeLanes } from '../../agentd/tests/helpers.js'
 import { Board } from '../src/host/board.js'
-import type { Delivery, Liveness, RouterLink, WorkerRuntime } from '../src/host/runtime.js'
+import type {
+  Delivery,
+  Liveness,
+  RouterLink,
+  TranscriptLine,
+  WorkerRuntime,
+} from '../src/host/runtime.js'
 import { DEFAULT_CONFIG, SuperAgentService } from '../src/host/service.js'
 import { memoryTables } from '../src/host/tables.js'
 
@@ -35,8 +41,9 @@ class FakeWorkers implements WorkerRuntime {
   status(sessionId: string): Liveness {
     return this.sessions.get(sessionId)?.status ?? 'gone'
   }
-  async transcript(): Promise<string> {
-    return 'assistant: 做完了'
+  lines: TranscriptLine[] | undefined = [{ role: 'assistant', text: '做完了' }]
+  async transcript(): Promise<TranscriptLine[] | undefined> {
+    return this.lines
   }
 }
 
@@ -418,5 +425,85 @@ describe('readonly tickets', () => {
     await service.dispatch({ title: '查', task: '查', project: 'beta', readonly: true })
     await service.dispatch({ title: '改', task: '改', project: 'beta' })
     expect(service.board.get(3)?.state).toBe('queued')
+  })
+})
+
+describe('chain of recall', () => {
+  it('a follow-up links both ways, and a follows naming no ticket is dropped with a word', async () => {
+    await service.dispatch({ title: '修登录', task: '登录重试改退避', project: 'alpha' })
+    await service.close(1)
+    const next = await service.dispatch({
+      title: '修登录第二轮',
+      task: '接着改',
+      project: 'alpha',
+      follows: 1,
+    })
+    expect(next.text).not.toContain('没记接续关系')
+    expect(service.board.get(2)?.follows).toBe(1)
+    const slip = await service.dispatch({ title: '别的', task: 'p', project: 'beta', follows: 99 })
+    expect(slip).toMatchObject({ ok: true })
+    expect(slip.text).toContain('没有奏折 #99，没记接续关系')
+    expect(service.board.get(3)?.follows).toBeUndefined()
+
+    expect((await service.read(2, 'summary')).text).toContain(
+      '接续自：#1 · alpha · 修登录（已结束）',
+    )
+    expect((await service.read(1, 'summary')).text).toContain('后续：#2 · alpha · 修登录第二轮（')
+    expect((await service.read(3, 'summary')).text).not.toMatch(/接续自|后续/)
+  })
+
+  it('find searches ended tickets too, by word and project, newest first', async () => {
+    await service.dispatch({ title: '修登录', task: 'a', project: 'alpha' })
+    await service.dispatch({ title: '加导出', task: '导出 CSV', project: 'beta' })
+    await service.report(sessionOf(2), '顺手把登录页按钮也改了')
+    await service.close(1)
+    expect(service.find({ query: '登录' }).map(t => t.id)).toEqual([2, 1])
+    expect(service.find({ query: 'csv' }).map(t => t.id)).toEqual([2])
+    expect(service.find({ query: '登录', project: 'ALP' }).map(t => t.id)).toEqual([1])
+    expect(service.find({ query: '登录', limit: 1 }).map(t => t.id)).toEqual([2])
+  })
+
+  it('a long task is cut in summary with the way to the whole', async () => {
+    const long = '把登录重试改成指数退避。'.repeat(150)
+    await service.dispatch({ title: 't', task: long, project: 'alpha' })
+    const summary = (await service.read(1, 'summary')).text
+    expect(summary).toContain(
+      `（共 ${long.length} 字，已截断，superagent_read id=1 depth=task 取全文）`,
+    )
+    expect(summary).not.toContain(long)
+    expect((await service.read(1, 'task')).text).toBe(long)
+  })
+
+  it('events page back from before an event id', async () => {
+    await service.dispatch({ title: 't', task: 'p', project: 'alpha' })
+    for (const text of ['一', '二', '三']) await service.report(sessionOf(1), text)
+    const last = (await service.read(1, 'events', { limit: 2 })).text.split('\n')
+    const before = Number(/before=(\d+)/.exec(last[0] ?? '')?.[1])
+    expect(last[0]).toBe(`（更早还有：superagent_read id=1 depth=events before=${before}）`)
+    expect(last.slice(1).map(l => l.split('：').at(-1))).toEqual(['二', '三'])
+    const older = (await service.read(1, 'events', { before })).text
+    expect(older).not.toContain('更早还有')
+    expect(older).toContain('dispatched')
+    expect(older).not.toContain('：二')
+  })
+
+  it('a transcript pages back by line, and a cut line reads whole by its row', async () => {
+    await service.dispatch({ title: 't', task: 'p', project: 'alpha' })
+    const long = '长'.repeat(700)
+    workers.lines = [
+      ...Array.from({ length: 5 }, (_, i) => ({ role: 'user', text: `第 ${i} 句` })),
+      { role: 'assistant', text: long },
+    ]
+    const tail = (await service.read(1, 'transcript', { limit: 3 })).text.split('\n')
+    expect(tail[0]).toBe('（更早还有：superagent_read id=1 depth=transcript before=3）')
+    expect(tail.at(-1)).toBe(
+      `assistant: ${'长'.repeat(600)}…（已截断，superagent_read id=1 depth=transcript row=5 取全文）`,
+    )
+    expect((await service.read(1, 'transcript', { row: 5 })).text).toBe(`assistant: ${long}`)
+    expect((await service.read(1, 'transcript', { row: 9 })).ok).toBe(false)
+    const older = (await service.read(1, 'transcript', { before: 3, limit: 3 })).text
+    expect(older).toBe('user: 第 0 句\nuser: 第 1 句\nuser: 第 2 句')
+    workers.lines = undefined
+    expect((await service.read(1, 'transcript')).ok).toBe(false)
   })
 })

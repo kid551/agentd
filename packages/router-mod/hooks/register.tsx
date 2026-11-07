@@ -23,8 +23,11 @@ import {
   chatMissNote,
   digest,
   endedPage,
+  eventsText,
   FOLD_ROWS,
+  foundText,
   header,
+  linkLines,
   LINK,
   isLong,
   mentionDepth,
@@ -37,7 +40,12 @@ import {
   stateLook,
   openMrMessage,
   phaseWord,
+  promptLine,
   ticketSections,
+  transcriptText,
+  type Brief,
+  type EventRow,
+  type TranscriptRow,
 } from './text'
 
 const PLUGIN = 'agentd-router'
@@ -135,6 +143,11 @@ const TOOLS = [
             '只查看、分析、回答问题，不改任何东西时设 true：Worker 写不了文件，不占项目，可以马上并行开始',
         },
         model: { type: 'string', description: '只在用户指定时填，如 sonnet / opus' },
+        follows: {
+          type: 'number',
+          description:
+            '这件事接着一张旧 ticket 做时填它的号（先用 find 找到）。两张 ticket 的 read 会互相链到对方',
+        },
       },
       required: ['project', 'title', 'prompt'],
     },
@@ -147,15 +160,30 @@ const TOOLS = [
   {
     name: 'read',
     description:
-      '读某张 ticket 的细节（链式召回）。what=summary：任务原文、状态、最近消息与待答问题；events：事件流全文；transcript：Worker 会话最后几条记录。',
+      '读某张 ticket 的细节（链式召回）。what=summary：任务、状态、最近消息、待答问题，以及它接续的和接续它的 ticket；prompt：任务原文全文；events：事件流全文；transcript：Worker 会话最后几条记录。结果被截断或还有更早的部分时，会写明下一次 read 该带的参数（before、row），照着读。',
     inputSchema: {
       type: 'object',
       properties: {
         ticket: { type: 'number' },
-        what: { type: 'string', enum: ['summary', 'events', 'transcript'] },
+        what: { type: 'string', enum: ['summary', 'prompt', 'events', 'transcript'] },
         limit: { type: 'number' },
+        before: { type: 'number', description: 'events / transcript：读这个位置之前的一页' },
+        row: { type: 'number', description: 'transcript：读被截断的这一条全文' },
       },
       required: ['ticket'],
+    },
+  },
+  {
+    name: 'find',
+    description:
+      '查历史 ticket，已结束的也在内（status 只列进行中的）。用户提起旧任务（「上次那个」「之前改登录的」）时用：按关键词（匹配标题、任务原文、最近消息）和 / 或项目找，最新的在前。找到后用 read 看细节。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: '关键词，一两个词' },
+        project: { type: 'string', description: '项目名的一部分' },
+        limit: { type: 'number' },
+      },
     },
   },
   {
@@ -560,6 +588,7 @@ export const register: Register = on => {
           prompt: input.prompt,
           readonly: input.readonly === true,
           ...(typeof input.model === 'string' && input.model ? { model: input.model } : {}),
+          ...(Number.isInteger(input.follows) ? { follows: input.follows } : {}),
         })
         if (!r.ok) return fail(r.reason)
         await refresh()
@@ -583,51 +612,74 @@ export const register: Register = on => {
         return ok(hits.map(p => `${p.id}  ${p.path}`).join('\n') || '没有匹配的项目。')
       }
 
+      if (tool === 'find') {
+        const word = (v: unknown): string => (typeof v === 'string' ? v.trim() : '')
+        const query = [
+          `q=${encodeURIComponent(word(input.query))}`,
+          `project=${encodeURIComponent(word(input.project))}`,
+          ...(Number.isInteger(input.limit) ? [`limit=${String(input.limit)}`] : []),
+        ].join('&')
+        const r = await api.get<Ticket[]>(`/tickets/search?${query}`)
+        if (!r.ok) return fail(r.reason)
+        return ok(
+          foundText(
+            r.data.map(t => ({
+              ...lite(t),
+              followsId: t.followsId ?? null,
+              endedAt: t.endedAt ?? null,
+            })),
+          ),
+        )
+      }
+
       const id = Number(input.ticket)
       if (!Number.isInteger(id) || id <= 0) return fail('需要 ticket 号')
 
       if (tool === 'read') {
         const what = typeof input.what === 'string' ? input.what : 'summary'
         const limit = Number(input.limit ?? 20)
+        const before = Number.isInteger(input.before) ? `&before=${String(input.before)}` : ''
         if (what === 'events') {
-          const r = await api.get<{ kind: string; actor: string; body: { text?: string } }[]>(
-            `/tickets/${id}/events?limit=${limit}`,
+          // A daemon older than paging answers a bare array.
+          const r = await api.get<EventRow[] | { events: EventRow[]; more: boolean }>(
+            `/tickets/${id}/events?limit=${limit}${before}`,
           )
-          return r.ok
-            ? ok(r.data.map(ev => `${ev.kind}（${ev.actor}）：${ev.body.text ?? ''}`).join('\n'))
-            : fail(r.reason)
+          if (!r.ok) return fail(r.reason)
+          const page = Array.isArray(r.data) ? { events: r.data, more: false } : r.data
+          return ok(eventsText(id, page.events, page.more))
         }
         if (what === 'transcript') {
-          const r = await api.get<{ role: string; text: string; tools: string[] }[]>(
-            `/tickets/${id}/transcript?tail=${limit}`,
+          if (Number.isInteger(input.row)) {
+            const r = await api.get<TranscriptRow>(`/tickets/${id}/transcript/${String(input.row)}`)
+            return r.ok ? ok(transcriptText(id, [r.data], false)) : fail(r.reason)
+          }
+          const r = await api.get<TranscriptRow[] | { rows: TranscriptRow[]; more: boolean }>(
+            `/tickets/${id}/transcript?tail=${limit}${before}`,
           )
-          return r.ok
-            ? ok(
-                r.data
-                  .map(
-                    row =>
-                      `${row.role}${row.tools.length ? ` [${row.tools.join(', ')}]` : ''}：${row.text}`,
-                  )
-                  .join('\n'),
-              )
-            : fail(r.reason)
+          if (!r.ok) return fail(r.reason)
+          const page = Array.isArray(r.data) ? { rows: r.data, more: false } : r.data
+          return ok(transcriptText(id, page.rows, page.more))
         }
-        const r = await api.get<Ticket & { prompt: string }>(`/tickets/${id}`)
+        const r = await api.get<
+          Ticket & { prompt: string; follows?: Brief | null; followers?: Brief[] }
+        >(`/tickets/${id}`)
         if (!r.ok) return fail(r.reason)
         const t = r.data
+        if (what === 'prompt') return ok(t.prompt)
         const question = t.openQuestion
           ? `待答问题：${t.openQuestion.question}${t.openQuestion.options ? `（选项：${t.openQuestion.options.join(' / ')}）` : ''}`
           : ''
         return ok(
           [
             `${header(t)}（${phaseWord(t)}${t.readonly ? '，只读' : ''}）目录：${t.cwd}${t.branch ? `，分支 ${t.branch}` : ''}`,
-            `任务：${t.prompt}`,
+            promptLine(t.id, t.prompt),
             // The open question is the latest message while it waits: say it once.
             t.lastReport && t.lastReport !== t.openQuestion?.question
               ? `最近消息：${t.lastReport}${t.lastAnswer ? `\n你答：${t.lastAnswer}` : ''}`
               : '',
             question,
-            '更多：read 的 what=events 看事件流，what=transcript 看 Worker 会话。',
+            ...linkLines(t.follows, t.followers),
+            '更多：read 的 what=events 看事件流，what=transcript 看 Worker 会话；接续的 ticket 用 read ticket=它的号。',
           ]
             .filter(Boolean)
             .join('\n'),

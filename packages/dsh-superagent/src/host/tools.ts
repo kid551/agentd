@@ -81,6 +81,13 @@ function tool(
 
 const ID = { id: int('奏折号（#后面的数字）') }
 
+/** 「 · 11月3日结束」for an ended ticket in a list; empty for a live one. */
+const endedDay = (at: number | undefined): string => {
+  if (at === undefined) return ''
+  const day = new Date(at)
+  return ` · ${day.getMonth() + 1}月${day.getDate()}日结束`
+}
+
 export function routerTools(service: SuperAgentService): ToolDefinition[] {
   return [
     tool(
@@ -95,6 +102,9 @@ export function routerTools(service: SuperAgentService): ToolDefinition[] {
             type: 'boolean',
             description: '只查看、分析、回答问题，不改任何东西时设 true',
           },
+          follows: int(
+            '这件事接着一张旧奏折做时填它的号（先用 superagent_list 找到）。两张奏折的 superagent_read 会互相链到对方',
+          ),
         },
         ['title', 'task', 'project'],
       ),
@@ -104,6 +114,7 @@ export function routerTools(service: SuperAgentService): ToolDefinition[] {
           task: args.task as string,
           project: args.project as string,
           readonly: args.readonly === true,
+          ...(typeof args.follows === 'number' ? { follows: args.follows } : {}),
         }),
     ),
     tool(
@@ -147,17 +158,36 @@ export function routerTools(service: SuperAgentService): ToolDefinition[] {
     ),
     tool(
       'superagent_list',
-      '列出奏折。默认只列进行中和 24 小时内结束的。',
-      object({ scope: { type: 'string', enum: ['live', 'all'], description: 'live 或 all' } }, []),
+      '列出奏折。默认只列进行中和 24 小时内结束的。用户提起旧任务（「上次那个」「之前改登录的」）时带 query（匹配标题、任务原文、最近消息）和 / 或 project 查，已结束的也在内，最新的在前。',
+      object(
+        {
+          scope: { type: 'string', enum: ['live', 'all'], description: 'live 或 all' },
+          query: str('关键词，一两个词'),
+          project: str('项目名的一部分'),
+          limit: int('最多列几张，默认 20'),
+        },
+        [],
+      ),
       async args => {
-        const tickets = service.list(args.scope === 'all' ? 'all' : 'live')
-        if (tickets.length === 0) return { ok: true, text: '没有奏折。' }
+        const search = typeof args.query === 'string' || typeof args.project === 'string'
+        const tickets = search
+          ? service.find({
+              query: args.query as string | undefined,
+              project: args.project as string | undefined,
+              limit: args.limit as number | undefined,
+            })
+          : service.list(args.scope === 'all' ? 'all' : 'live')
+        if (tickets.length === 0)
+          return {
+            ok: true,
+            text: search ? '没有找到。换个关键词，或去掉项目再找。' : '没有奏折。',
+          }
         return {
           ok: true,
           text: tickets
             .map(
               t =>
-                `${header(t)}（${phaseWord(t)}${t.readonly === true ? ' · 只读' : t.worktree ? ' · MR' : ''}）${t.lastReport ? ` · ${t.lastReport.slice(0, 120)}` : ''}`,
+                `${header(t)}（${phaseWord(t)}${t.readonly === true ? ' · 只读' : t.worktree ? ' · MR' : ''}${endedDay(t.endedAt)}）${t.follows === undefined ? '' : ` · 接续 #${t.follows}`}${t.lastReport ? ` · ${t.lastReport.slice(0, 120)}` : ''}`,
             )
             .join('\n'),
         }
@@ -165,22 +195,30 @@ export function routerTools(service: SuperAgentService): ToolDefinition[] {
     ),
     tool(
       'superagent_read',
-      '读一张奏折的细节。depth：summary（任务与最近消息）→ events（事件全文）→ transcript（Worker 会话尾部）。',
+      '读一张奏折的细节（链式召回）。depth：summary（任务、最近消息，以及它接续的和接续它的奏折）→ task（任务原文全文）/ events（事件全文）→ transcript（Worker 会话）。结果被截断或还有更早的部分时，会写明下一次该带的参数（before、row），照着读。',
       object(
         {
           ...ID,
           depth: {
             type: 'string',
-            enum: ['summary', 'events', 'transcript'],
+            enum: ['summary', 'task', 'events', 'transcript'],
             description: '读多深',
           },
+          limit: int('events / transcript：一页几条'),
+          before: int('events / transcript：读这个位置之前的一页'),
+          row: int('transcript：读被截断的这一条全文'),
         },
         ['id'],
       ),
       args =>
         service.read(
           args.id as number,
-          (args.depth as 'summary' | 'events' | 'transcript' | undefined) ?? 'summary',
+          (args.depth as 'summary' | 'task' | 'events' | 'transcript' | undefined) ?? 'summary',
+          {
+            ...(typeof args.limit === 'number' ? { limit: args.limit } : {}),
+            ...(typeof args.before === 'number' ? { before: args.before } : {}),
+            ...(typeof args.row === 'number' ? { row: args.row } : {}),
+          },
         ),
     ),
     tool(

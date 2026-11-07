@@ -19,7 +19,7 @@ import { GRANT_TTL_MS, isApproval, workerSettings } from './permission.js'
 import { resolveProject, scanRoots } from './projects.js'
 import type { Input } from './state.js'
 import type { ApplyResult, Store } from './store.js'
-import { type Activity, findTranscript, readActivity, readTail } from './transcript.js'
+import { type Activity, findTranscript, readActivity, readRow, readRows } from './transcript.js'
 import {
   ACTIVE,
   OCCUPYING,
@@ -29,6 +29,7 @@ import {
   type Project,
   type ResolveResult,
   type TicketView,
+  type TranscriptPage,
   type TranscriptRow,
 } from './types.js'
 import { workerPrompt } from './worker-prompt.js'
@@ -121,6 +122,14 @@ export class Daemon {
           : `没有叫「${input.project}」的项目。${names ? `相近的有：${names}。` : ''}请问用户。`
       return { ok: false, reason, resolve: resolved }
     }
+    // A follows naming no ticket is a slip in the Router's recall: the task
+    // itself is fine, so it goes out without the link and the Router is told.
+    const follows =
+      input.follows !== undefined && this.store.ticket(input.follows) ? input.follows : undefined
+    const followNote =
+      input.follows !== undefined && follows === undefined
+        ? `没有 ticket #${input.follows}，没记接续关系`
+        : undefined
     const readonly = input.readonly === true
     const lane = readonly ? { worktree: false } : this.wantsLane(resolved.project.path)
     const ticket = this.store.createTicket({
@@ -131,11 +140,13 @@ export class Daemon {
       // A writing ticket in an MR project gets its own lane; nothing else does.
       worktree: lane.worktree,
       readonly,
+      ...(follows === undefined ? {} : { followsId: follows }),
     })
     if (lane.note) this.log(`ticket #${ticket.id}: ${lane.note}`)
     this.changed()
     void this.tick()
-    return lane.note ? { ok: true, ticket, note: lane.note } : { ok: true, ticket }
+    const note = [lane.note, followNote].filter(Boolean).join('；')
+    return note ? { ok: true, ticket, note } : { ok: true, ticket }
   }
 
   /**
@@ -461,11 +472,21 @@ export class Daemon {
     }
   }
 
-  transcript(ticketId: number, limit: number): TranscriptRow[] | null {
+  /** The Worker's rows before byte `before` (the end when absent); null without a transcript. */
+  transcript(ticketId: number, limit: number, before?: number): TranscriptPage | null {
+    const file = this.transcriptFile(ticketId)
+    return file ? readRows(file, { limit, ...(before === undefined ? {} : { before }) }) : null
+  }
+
+  /** One row of the Worker's transcript whole, by the offset its page gave. */
+  transcriptRow(ticketId: number, at: number): TranscriptRow | null {
+    const file = this.transcriptFile(ticketId)
+    return file ? readRow(file, at) : null
+  }
+
+  private transcriptFile(ticketId: number): string | null {
     const ticket = this.store.ticket(ticketId)
-    if (!ticket?.workerSessionId) return null
-    const file = findTranscript(ticket.workerSessionId)
-    return file ? readTail(file, limit) : null
+    return ticket?.workerSessionId ? findTranscript(ticket.workerSessionId) : null
   }
 
   /** The last lines each working Worker wrote, so the person can see it is alive. */

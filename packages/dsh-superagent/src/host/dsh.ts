@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { mkdir } from 'node:fs/promises'
 
-import type { Delivery, Liveness, RouterLink, WorkerRuntime } from './runtime.js'
+import type { Delivery, Liveness, RouterLink, TranscriptLine, WorkerRuntime } from './runtime.js'
 
 // The structural slice of the dsh services this plugin uses. Written against
 // the installed 0.2.1-rc.5 packages; see implementation-notes.md (dsh section)
@@ -167,19 +167,18 @@ export function dshWorkers(
       ctx.agents.get(sessionId)?.cancel({ kind: 'user' }, { keepInbox: false })
     },
     status: sessionId => liveness(ctx, sessionId),
-    async transcript(sessionId, maxChars) {
+    async transcript(sessionId) {
       const agent = await live(ctx, log, sessionId)
-      if (agent === undefined) return '会话打不开。'
-      const lines: string[] = []
+      if (agent === undefined) return undefined
+      const lines: TranscriptLine[] = []
       for (const m of agent.session.deriveMessages()) {
         for (const block of m.content) {
-          if (block.type === 'text' && block.text) lines.push(`${m.role}: ${block.text}`)
+          if (block.type === 'text' && block.text) lines.push({ role: m.role, text: block.text })
           else if (block.type === 'tool-call' && block.name)
-            lines.push(`${m.role}: ▸ ${block.name}`)
+            lines.push({ role: m.role, text: `▸ ${block.name}` })
         }
       }
-      const all = lines.join('\n')
-      return all.length > maxChars ? `…${all.slice(-maxChars)}` : all || '会话是空的。'
+      return lines
     },
   }
 }

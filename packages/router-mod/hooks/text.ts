@@ -9,12 +9,13 @@ export const ROUTER_PROMPT = `# 你是 agentd 的 Router
 
 ## 你只做三件事
 1. 派工：用户要做事时，调 agentd 的 dispatch 工具开 ticket。项目名有歧义或范围不清，先问用户一次，不要猜。title 用一句不超过 30 字的中文概括。prompt 写成 Worker 能独立执行的完整任务描述，保留用户原话里的约束。
+   用户要接着一张已结束、收掉的旧 ticket 做，开新 ticket 并带 follows=旧号，prompt 里写清上次做到哪（先 read 它）。
 2. 转述：Worker 的提问、交付、受阻，会以「[agentd] N 条新事件」的消息送到你这里。逐条转述给用户。
 3. 路由：用户的回答、追加指令、验收、叫停，用 answer / message / close / stop 送到对应 ticket。Worker 提问后不会停下来干等，所以有待答问题时也能用 message 追加指令；但用户的话是在回答那个问题时，用 answer。权限请求例外：Worker 停在那里等审批，只能用 answer。
 
 ## 你不做的事
 - 不读代码、不改文件、不跑命令：这些工具对你是禁用的。需要动手就派给 Worker。
-- 不凭记忆回答 ticket 的细节，先调 read 工具。
+- 不凭记忆回答 ticket 的细节，先调 read 工具。用户提起的旧任务不在进行中，用 find 按关键词或项目找；read 的结果里带着下一步能读的号和参数，顺着读，不要猜。
 - 不替用户拍板 Worker 的问题，也不替用户批准权限请求。
 
 ## 说话方式
@@ -34,7 +35,7 @@ export const ROUTER_PROMPT = `# 你是 agentd 的 Router
 - 纯文档或很小的改动，如果同项目已经有一张在做的 MR 奏折，建议用户并进那张（用 message 追加给它），而不是单独开一个 MR：有的项目 main 每进一个提交都要重跑整条流水线。`
 
 export const COMPACT_NOTE =
-  '保留：所有仍未结束的 ticket 号、标题与状态，用户最近的指示，以及用户最近单聊的 ticket。ticket 细节可以丢，事后用 agentd 的 read 工具取回。'
+  '保留：所有仍未结束的 ticket 号、标题与状态，用户最近的指示，以及用户最近单聊的 ticket。ticket 细节可以丢，事后用 agentd 的 read 工具取回，已结束的用 find 找回。'
 
 const STATE_WORDS: Record<TicketLite['state'], string> = {
   queued: '排队',
@@ -139,6 +140,78 @@ export function endedPage(
     .sort((a, b) => b.id - a.id)
     .slice(at * ENDED_PAGE_SIZE, (at + 1) * ENDED_PAGE_SIZE)
   return { rows, page: at, pages }
+}
+
+/** A ticket's task shows this long in read summary; what=prompt gives it whole. */
+export const PROMPT_CHARS = 1200
+
+/** Another ticket as a summary names it: one hop along the chain of recall. */
+export type Brief = { id: number; title: string; project: string; state: TicketLite['state'] }
+
+/** The lines read summary gives for the ticket this one carries on and the ones carrying it on. */
+export function linkLines(follows: Brief | null | undefined, followers: Brief[] = []): string[] {
+  const lines: string[] = []
+  if (follows) lines.push(`接续自：${header(follows)}（${stateWord(follows.state)}）`)
+  if (followers.length > 0)
+    lines.push(`后续：${followers.map(f => `${header(f)}（${stateWord(f.state)}）`).join('；')}`)
+  return lines
+}
+
+/** The task as read summary shows it: cut, with the way to the whole. */
+export function promptLine(id: number, prompt: string): string {
+  if (prompt.length <= PROMPT_CHARS) return `任务：${prompt}`
+  return `任务：${prompt.slice(0, PROMPT_CHARS)}…（共 ${prompt.length} 字，已截断，read ticket=${id} what=prompt 取全文）`
+}
+
+export type EventRow = { id: number; kind: string; actor: string; body: { text?: string } }
+
+/** read what=events: oldest first, and how to go further back when there is more. */
+export function eventsText(id: number, events: EventRow[], more: boolean): string {
+  const lines = events.map(ev => `${ev.kind}（${ev.actor}）：${ev.body.text ?? ''}`)
+  const first = events[0]
+  if (more && first) lines.unshift(`（更早还有：read ticket=${id} what=events before=${first.id}）`)
+  return lines.join('\n') || '没有事件。'
+}
+
+export type TranscriptRow = {
+  role: string
+  text: string
+  tools: string[]
+  /** Absent from daemons older than transcript paging. */
+  at?: number
+  isCut?: boolean
+}
+
+/** read what=transcript: a cut row says how to read it whole, the page how to go back. */
+export function transcriptText(id: number, rows: TranscriptRow[], more: boolean): string {
+  const lines = rows.map(row => {
+    const tools = row.tools.length ? ` [${row.tools.join(', ')}]` : ''
+    const whole =
+      row.isCut && row.at !== undefined
+        ? `…（已截断，read ticket=${id} what=transcript row=${row.at} 取全文）`
+        : ''
+    return `${row.role}${tools}：${row.text}${whole}`
+  })
+  const first = rows[0]
+  if (more && first?.at !== undefined)
+    lines.unshift(`（更早还有：read ticket=${id} what=transcript before=${first.at}）`)
+  return lines.join('\n') || '没有会话记录。'
+}
+
+/** find: one line a ticket, newest first, ended ones with the day they ended. */
+export function foundText(
+  tickets: (TicketLite & { followsId?: number | null; endedAt?: number | null })[],
+): string {
+  if (tickets.length === 0) return '没有找到。换个关键词，或去掉项目再找。'
+  return tickets
+    .map(t => {
+      const day = t.endedAt ? new Date(t.endedAt) : null
+      const when = day ? ` · ${day.getMonth() + 1}月${day.getDate()}日结束` : ''
+      const from = t.followsId ? ` · 接续 #${t.followsId}` : ''
+      const last = t.lastReport ? ` · ${t.lastReport.slice(0, 120)}` : ''
+      return `${header(t)}（${phaseWord(t)}${when}）${from}${last}`
+    })
+    .join('\n')
 }
 
 /** One message for the Router holding every event that waited (batching). */

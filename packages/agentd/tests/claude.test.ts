@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { describe, expect, test } from 'vitest'
 
 import { isWorkerGone, parseAgents, parseBgId, spawnArgv, type WorkerInfo } from '../src/claude.js'
-import { findTranscript, readActivity, readTail } from '../src/transcript.js'
+import { findTranscript, readActivity, readRow, readRows } from '../src/transcript.js'
 
 describe('spawnArgv', () => {
   const spec = {
@@ -109,7 +109,7 @@ describe('transcripts', () => {
     expect(findTranscript('missing', dir)).toBeNull()
   })
 
-  test('readTail keeps prompts, answers and tool names, and skips meta rows', () => {
+  test('readRows keeps prompts, answers and tool names, and skips meta rows', () => {
     const dir = mkdtempSync(join(tmpdir(), 'agentd-tail-'))
     const file = join(dir, 's.jsonl')
     const rows = [
@@ -120,13 +120,63 @@ describe('transcripts', () => {
       { type: 'user', message: { content: [{ type: 'tool_result', content: 'a.txt' }] } },
       { type: 'assistant', message: { content: [{ type: 'text', text: 'a.txt b.txt' }] } },
     ]
-    writeFileSync(file, rows.map(r => JSON.stringify(r)).join('\n') + '\nnot json\n')
-    expect(readTail(file)).toEqual([
-      { role: 'user', text: '列出文件', tools: [] },
-      { role: 'assistant', text: '', tools: ['Bash'] },
-      { role: 'assistant', text: 'a.txt b.txt', tools: [] },
-    ])
-    expect(readTail(file, 1)).toHaveLength(1)
+    const lines = rows.map(r => JSON.stringify(r))
+    writeFileSync(file, lines.join('\n') + '\nnot json\n')
+    // A row's id is the byte offset its line starts at.
+    const at = (i: number): number =>
+      Buffer.byteLength(lines.slice(0, i).join('\n')) + (i > 0 ? 1 : 0)
+    expect(readRows(file)).toEqual({
+      rows: [
+        { role: 'user', text: '列出文件', tools: [], at: at(1), isCut: false },
+        { role: 'assistant', text: '', tools: ['Bash'], at: at(3), isCut: false },
+        { role: 'assistant', text: 'a.txt b.txt', tools: [], at: at(5), isCut: false },
+      ],
+      more: false,
+    })
+    expect(readRows(file, { limit: 1 })).toMatchObject({ rows: [{ at: at(5) }], more: true })
+  })
+
+  test('a cut row reads whole by its id, and a page goes on before the oldest row shown', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'agentd-page-'))
+    const file = join(dir, 's.jsonl')
+    const long = '长'.repeat(700)
+    const lines = [
+      ...Array.from({ length: 5 }, (_, i) => ({
+        type: 'user',
+        message: { content: `第 ${i} 句` },
+      })),
+      { type: 'assistant', message: { content: [{ type: 'text', text: long }] } },
+    ].map(r => JSON.stringify(r))
+    writeFileSync(file, lines.join('\n') + '\n')
+
+    const last = readRows(file, { limit: 3 })
+    expect(last.more).toBe(true)
+    const cut = last.rows.at(-1)!
+    expect(cut).toMatchObject({ isCut: true })
+    expect(cut.text).toHaveLength(600)
+    expect(readRow(file, cut.at)?.text).toBe(long)
+    // An offset inside a line names no row.
+    expect(readRow(file, cut.at + 1)).toBeNull()
+
+    const older = readRows(file, { limit: 3, before: last.rows[0]!.at })
+    expect(older.rows.map(r => r.text)).toEqual(['第 0 句', '第 1 句', '第 2 句'])
+    expect(older.more).toBe(false)
+  })
+
+  test('readRows walks back past a chunk and over a line longer than one', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'agentd-chunk-'))
+    const file = join(dir, 's.jsonl')
+    const huge = {
+      type: 'user',
+      message: { content: [{ type: 'tool_result', content: 'x'.repeat(2.5 * 1024 * 1024) }] },
+    }
+    const lines = [
+      { type: 'user', message: { content: '最早的一句' } },
+      huge,
+      { type: 'assistant', message: { content: '最近的一句' } },
+    ].map(r => JSON.stringify(r))
+    writeFileSync(file, lines.join('\n') + '\n')
+    expect(readRows(file).rows.map(r => r.text)).toEqual(['最早的一句', '最近的一句'])
   })
 
   test('readActivity gives the last lines a Worker wrote, tool calls by what they do, and when', () => {

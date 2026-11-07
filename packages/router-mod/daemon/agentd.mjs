@@ -728,33 +728,98 @@ function tail(file, bytes) {
 		closeSync(fd);
 	}
 }
-/** The conversation's last `limit` rows a person would read: prompts, answers, tool names. */
-function readTail(file, limit = 20, charsPerRow = 600) {
-	const rows = [];
-	for (const line of tail(file, 1048576).split("\n")) {
-		if (!line.trim()) continue;
-		let entry;
-		try {
-			entry = JSON.parse(line);
-		} catch {
-			continue;
-		}
-		if (entry.type !== "user" && entry.type !== "assistant" || entry.isMeta) continue;
-		const content = entry.message?.content;
-		const blocks = typeof content === "string" ? [{
-			type: "text",
-			text: content
-		}] : content ?? [];
-		const text = blocks.filter((b) => b.type === "text" && b.text).map((b) => b.text).join("\n").trim();
-		const tools = blocks.filter((b) => b.type === "tool_use" && b.name).map((b) => b.name);
-		if (!text && tools.length === 0) continue;
-		rows.push({
-			role: entry.type,
-			text: text.slice(0, charsPerRow),
-			tools
-		});
+/** One transcript line as a row a person would read; null for meta, tool results and the like. */
+function parseRow(line, at, charsPerRow) {
+	if (!line.trim()) return null;
+	let entry;
+	try {
+		entry = JSON.parse(line);
+	} catch {
+		return null;
 	}
-	return rows.slice(-limit);
+	if (entry.type !== "user" && entry.type !== "assistant" || entry.isMeta) return null;
+	const content = entry.message?.content;
+	const blocks = typeof content === "string" ? [{
+		type: "text",
+		text: content
+	}] : content ?? [];
+	const text = blocks.filter((b) => b.type === "text" && b.text).map((b) => b.text).join("\n").trim();
+	const tools = blocks.filter((b) => b.type === "tool_use" && b.name).map((b) => b.name);
+	if (!text && tools.length === 0) return null;
+	return {
+		role: entry.type,
+		text: text.slice(0, charsPerRow),
+		tools,
+		at,
+		isCut: text.length > charsPerRow
+	};
+}
+const CHUNK = 1048576;
+/**
+* The conversation's last `limit` rows a person would read (prompts, answers,
+* tool names) ending before byte `before`, each cut to `charsPerRow`. Reads the
+* file backwards a chunk at a time until it has them. A line longer than a
+* chunk (a huge tool result) is skipped: it holds nothing shown here.
+*/
+function readRows(file, options = {}) {
+	const limit = options.limit ?? 20;
+	const charsPerRow = options.charsPerRow ?? 600;
+	const fd = openSync(file, "r");
+	try {
+		let stop = Math.min(options.before ?? Infinity, fstatSync(fd).size);
+		let rows = [];
+		while (stop > 0 && rows.length <= limit) {
+			const start = Math.max(0, stop - CHUNK);
+			const buffer = Buffer.alloc(stop - start);
+			readSync(fd, buffer, 0, buffer.length, start);
+			const from = start === 0 ? 0 : buffer.indexOf(10) + 1;
+			if (start > 0 && (from === 0 || from === buffer.length)) {
+				stop = start;
+				continue;
+			}
+			const found = [];
+			for (let i = from; i < buffer.length;) {
+				const nl = buffer.indexOf(10, i);
+				const j = nl === -1 ? buffer.length : nl;
+				const row = parseRow(buffer.toString("utf8", i, j), start + i, charsPerRow);
+				if (row) found.push(row);
+				i = j + 1;
+			}
+			rows = [...found, ...rows];
+			stop = start + from;
+		}
+		return {
+			rows: rows.slice(-limit),
+			more: rows.length > limit
+		};
+	} finally {
+		closeSync(fd);
+	}
+}
+/** The whole row starting at byte `at`; null when no row a person would read starts there. */
+function readRow(file, at) {
+	const fd = openSync(file, "r");
+	try {
+		const size = fstatSync(fd).size;
+		if (!Number.isInteger(at) || at < 0 || at >= size) return null;
+		if (at > 0) {
+			const prev = Buffer.alloc(1);
+			readSync(fd, prev, 0, 1, at - 1);
+			if (prev[0] !== 10) return null;
+		}
+		const parts = [];
+		for (let pos = at; pos < size;) {
+			const buffer = Buffer.alloc(Math.min(CHUNK, size - pos));
+			readSync(fd, buffer, 0, buffer.length, pos);
+			const nl = buffer.indexOf(10);
+			parts.push(nl === -1 ? buffer : buffer.subarray(0, nl));
+			if (nl !== -1) break;
+			pos += buffer.length;
+		}
+		return parseRow(Buffer.concat(parts).toString("utf8"), at, Infinity);
+	} finally {
+		closeSync(fd);
+	}
 }
 /** The one argument that says what a tool call is doing. */
 function toolLine(block) {
@@ -935,6 +1000,8 @@ var Daemon = class {
 				resolve: resolved
 			};
 		}
+		const follows = input.follows !== void 0 && this.store.ticket(input.follows) ? input.follows : void 0;
+		const followNote = input.follows !== void 0 && follows === void 0 ? `没有 ticket #${input.follows}，没记接续关系` : void 0;
 		const readonly = input.readonly === true;
 		const lane = readonly ? { worktree: false } : this.wantsLane(resolved.project.path);
 		const ticket = this.store.createTicket({
@@ -943,15 +1010,17 @@ var Daemon = class {
 			prompt: input.prompt,
 			model: input.model ?? this.config.worker.model,
 			worktree: lane.worktree,
-			readonly
+			readonly,
+			...follows === void 0 ? {} : { followsId: follows }
 		});
 		if (lane.note) this.log(`ticket #${ticket.id}: ${lane.note}`);
 		this.changed();
 		this.tick();
-		return lane.note ? {
+		const note = [lane.note, followNote].filter(Boolean).join("；");
+		return note ? {
 			ok: true,
 			ticket,
-			note: lane.note
+			note
 		} : {
 			ok: true,
 			ticket
@@ -1243,11 +1312,22 @@ var Daemon = class {
 			this.launching.delete(ticket.id);
 		}
 	}
-	transcript(ticketId, limit) {
+	/** The Worker's rows before byte `before` (the end when absent); null without a transcript. */
+	transcript(ticketId, limit, before) {
+		const file = this.transcriptFile(ticketId);
+		return file ? readRows(file, {
+			limit,
+			...before === void 0 ? {} : { before }
+		}) : null;
+	}
+	/** One row of the Worker's transcript whole, by the offset its page gave. */
+	transcriptRow(ticketId, at) {
+		const file = this.transcriptFile(ticketId);
+		return file ? readRow(file, at) : null;
+	}
+	transcriptFile(ticketId) {
 		const ticket = this.store.ticket(ticketId);
-		if (!ticket?.workerSessionId) return null;
-		const file = findTranscript(ticket.workerSessionId);
-		return file ? readTail(file, limit) : null;
+		return ticket?.workerSessionId ? findTranscript(ticket.workerSessionId) : null;
 	}
 	/** The last lines each working Worker wrote, so the person can see it is alive. */
 	activity() {
@@ -1635,6 +1715,12 @@ const count = (query, key, fallback) => {
 	const n = Number(query.get(key) ?? fallback);
 	return Number.isInteger(n) && n > 0 ? Math.min(n, 500) : fallback;
 };
+/** A non-negative integer cursor from the query; undefined when absent or not one. */
+const offset = (query, key) => {
+	const raw = query.get(key);
+	const n = Number(raw);
+	return raw !== null && Number.isInteger(n) && n >= 0 ? n : void 0;
+};
 /** A state change answers 200 with the ticket, or 409 with the reason it was refused. */
 const applied = (result) => result.ok ? { body: {
 	ok: true,
@@ -1685,6 +1771,15 @@ function routes(daemon, shutdown) {
 		],
 		[
 			"GET",
+			/^\/tickets\/search$/,
+			({ query }) => ({ body: store.searchTickets({
+				query: query.get("q") ?? "",
+				project: query.get("project") ?? "",
+				limit: count(query, "limit", 20)
+			}) })
+		],
+		[
+			"GET",
 			/^\/tickets$/,
 			({ query }) => {
 				const filter = query.get("state") ?? "open";
@@ -1695,11 +1790,13 @@ function routes(daemon, shutdown) {
 			"POST",
 			/^\/tickets$/,
 			({ body }) => {
+				const follows = Number(body.follows);
 				const result = daemon.dispatch({
 					project: str(body, "project"),
 					title: str(body, "title"),
 					prompt: str(body, "prompt"),
 					readonly: body.readonly === true,
+					...Number.isInteger(follows) && follows > 0 ? { follows } : {},
 					...typeof body.model === "string" && body.model ? { model: body.model } : {}
 				});
 				return result.ok ? {
@@ -1717,16 +1814,32 @@ function routes(daemon, shutdown) {
 			({ params }) => {
 				const ticket = store.ticket(id(params));
 				if (!ticket) throw new HttpError(404, "没有这个 ticket");
+				const brief = (t) => t && {
+					id: t.id,
+					title: t.title,
+					project: t.project,
+					state: t.state
+				};
 				return { body: {
 					...ticket,
-					prompt: store.ticketPrompt(ticket.id)
+					prompt: store.ticketPrompt(ticket.id),
+					follows: ticket.followsId === null ? null : brief(store.ticket(ticket.followsId)),
+					followers: store.followersOf(ticket.id).map(brief)
 				} };
 			}
 		],
 		[
 			"GET",
 			/^\/tickets\/(\d+)\/events$/,
-			({ params, query }) => ({ body: store.eventsOf(id(params), count(query, "limit", 50)) })
+			({ params, query }) => {
+				const limit = count(query, "limit", 50);
+				const page = store.eventsOf(id(params), limit + 1, offset(query, "before"));
+				const more = page.length > limit;
+				return { body: {
+					events: more ? page.slice(1) : page,
+					more
+				} };
+			}
 		],
 		[
 			"GET",
@@ -1737,9 +1850,18 @@ function routes(daemon, shutdown) {
 			"GET",
 			/^\/tickets\/(\d+)\/transcript$/,
 			({ params, query }) => {
-				const rows = daemon.transcript(id(params), count(query, "tail", 20));
-				if (!rows) throw new HttpError(404, "还找不到这个 Worker 的会话记录");
-				return { body: rows };
+				const page = daemon.transcript(id(params), count(query, "tail", 20), offset(query, "before"));
+				if (!page) throw new HttpError(404, "还找不到这个 Worker 的会话记录");
+				return { body: page };
+			}
+		],
+		[
+			"GET",
+			/^\/tickets\/(\d+)\/transcript\/(\d+)$/,
+			({ params }) => {
+				const row = daemon.transcriptRow(id(params), Number(params[1]));
+				if (!row) throw new HttpError(404, "这个 Worker 的会话记录里没有从这里开始的一条");
+				return { body: row };
 			}
 		],
 		[
@@ -2080,7 +2202,9 @@ const MIGRATIONS = [
    ALTER TABLE tickets ADD COLUMN worktree_path TEXT;
    ALTER TABLE tickets ADD COLUMN repo_path TEXT;
    ALTER TABLE tickets ADD COLUMN mr_opened_at INTEGER;`,
-	`ALTER TABLE tickets ADD COLUMN last_answer TEXT;`
+	`ALTER TABLE tickets ADD COLUMN last_answer TEXT;`,
+	`ALTER TABLE tickets ADD COLUMN follows_id INTEGER;
+   CREATE INDEX tickets_follows ON tickets (follows_id) WHERE follows_id IS NOT NULL;`
 ];
 /**
 * Kinds whose feed entry carries the progress report before it. Not `ready`:
@@ -2203,8 +2327,8 @@ var Store = class {
 	createTicket(input) {
 		return this.tx(() => {
 			const at = this.now();
-			const { lastInsertRowid } = this.db.prepare(`INSERT INTO tickets (title, project_id, cwd, prompt, state, worktree, readonly, model, created_at, updated_at)
-           VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)`).run(input.title, input.project.id, input.project.path, input.prompt, input.worktree ? 1 : 0, input.readonly ? 1 : 0, input.model, at, at);
+			const { lastInsertRowid } = this.db.prepare(`INSERT INTO tickets (title, project_id, cwd, prompt, state, worktree, readonly, model, follows_id, created_at, updated_at)
+           VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)`).run(input.title, input.project.id, input.project.path, input.prompt, input.worktree ? 1 : 0, input.readonly ? 1 : 0, input.model, input.followsId ?? null, at, at);
 			const id = Number(lastInsertRowid);
 			this.db.prepare("UPDATE tickets SET worker_name = ? WHERE id = ?").run(`agentd-w-${id}`, id);
 			this.addEvent(id, "dispatched", "router", { text: input.prompt });
@@ -2229,17 +2353,43 @@ var Store = class {
 		const args = filter === "recent" ? [this.now() - 864e5] : [];
 		return this.rows(`WHERE ${where}`, args);
 	}
+	/**
+	* Tickets ended or not, newest first: those whose title, task or latest
+	* message holds `query`, in a project whose id holds `project`. A LIKE scan:
+	* the table holds one row per task a person gave, so no index pays for itself.
+	*/
+	searchTickets(filter) {
+		const like = (s) => `%${s.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
+		const where = [];
+		const args = [];
+		const query = filter.query?.trim();
+		if (query) {
+			where.push(`(t.title LIKE ?1 ESCAPE '\\' OR t.prompt LIKE ?1 ESCAPE '\\' OR t.last_report LIKE ?1 ESCAPE '\\')`);
+			args.push(like(query));
+		}
+		const project = filter.project?.trim();
+		if (project) {
+			where.push(`t.project_id LIKE ?${args.length + 1} ESCAPE '\\'`);
+			args.push(like(project));
+		}
+		const limit = Math.max(1, Math.min(filter.limit ?? 20, 100));
+		return this.rows(where.length ? `WHERE ${where.join(" AND ")}` : "", args, `ORDER BY t.id DESC LIMIT ${limit}`);
+	}
+	/** The tickets that carry this one on, oldest first. */
+	followersOf(id) {
+		return this.rows("WHERE t.follows_id = ?", [id]);
+	}
 	ticketsInState(states) {
 		const marks = states.map(() => "?").join(", ");
 		return this.rows(`WHERE state IN (${marks})`, [...states]);
 	}
 	/** Tickets matching `where`, each with its open question, in one query. */
-	rows(where, args) {
+	rows(where, args, order = "ORDER BY t.id") {
 		return this.db.prepare(`SELECT t.*, q.id AS q_id, q.kind AS q_kind, q.question AS q_question,
                 q.options AS q_options, q.asked_at AS q_asked_at
          FROM tickets t
          LEFT JOIN questions q ON q.ticket_id = t.id AND q.answered_at IS NULL
-         ${where} ORDER BY t.id`).all(...args).map((r) => this.view(r));
+         ${where} ${order}`).all(...args).map((r) => this.view(r));
 	}
 	setWorker(id, worker) {
 		this.db.prepare(`UPDATE tickets SET
@@ -2361,11 +2511,12 @@ var Store = class {
          FROM events e JOIN tickets t ON t.id = e.ticket_id
          WHERE e.id > ? ORDER BY e.id LIMIT ?`).all(cursor, limit).map((r) => this.eventView(r));
 	}
-	eventsOf(ticketId, limit = 50) {
+	/** A ticket's last `limit` events, oldest first; with `before`, those older than that event id. */
+	eventsOf(ticketId, limit = 50, before = Number.MAX_SAFE_INTEGER) {
 		return this.db.prepare(`SELECT * FROM (
            SELECT e.*, t.title, t.project_id FROM events e JOIN tickets t ON t.id = e.ticket_id
-           WHERE e.ticket_id = ? ORDER BY e.id DESC LIMIT ?
-         ) ORDER BY id`).all(ticketId, limit).map((r) => ({
+           WHERE e.ticket_id = ? AND e.id < ? ORDER BY e.id DESC LIMIT ?
+         ) ORDER BY id`).all(ticketId, before, limit).map((r) => ({
 			...this.eventView(r),
 			body: JSON.parse(r.body)
 		}));
@@ -2445,6 +2596,7 @@ var Store = class {
 			workerBgId: row.worker_bg_id,
 			lastReport: row.last_report,
 			lastAnswer: row.last_answer,
+			followsId: row.follows_id,
 			openQuestion: row.q_id !== null ? {
 				id: row.q_id,
 				ticketId: row.id,

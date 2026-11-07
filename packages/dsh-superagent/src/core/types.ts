@@ -27,6 +27,8 @@ export type Ticket = {
   state: TicketState
   /** What the Worker is waiting on, while `asking`. */
   pending?: { kind: 'question' | 'approval'; summary: string; at: number }
+  /** The earlier ticket this one carries on, as the Router said at dispatch. */
+  follows?: number
   /** The latest message the Worker or the plugin sent the person, shown as 「最近消息」. */
   lastReport?: string
   createdAt: number

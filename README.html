@@ -172,11 +172,17 @@ node packages/agentd/dist/agentd.mjs dispatch memos "加搜索框" "给列表加
 <h3>3.1 PDF 机制在这里的落地</h3>
 <table>
 <tr><th>PDF</th><th>这里</th></tr>
-<tr><td>Router 不执行、只路由</td><td>插件的 <code>tool.call</code> 钩子在 Router 会话里拒绝 Bash、Edit、Write、NotebookEdit、Agent，也拒绝 Read、Grep、Glob、WebFetch、WebSearch——Router 连代码都不读，要看什么就派奏折。Router 只有 9 个 agentd 工具。</td></tr>
+<tr><td>Router 不执行、只路由</td><td>插件的 <code>tool.call</code> 钩子在 Router 会话里拒绝 Bash、Edit、Write、NotebookEdit、Agent，也拒绝 Read、Grep、Glob、WebFetch、WebSearch——Router 连代码都不读，要看什么就派奏折。Router 只有 12 个 agentd 工具。</td></tr>
 <tr><td>批处理（Batching）</td><td>插件每 2 秒拉一次事件流。需要人处理的事件先入队；Router 不在推理、且 1.5 秒内没有新事件时，整队合并成一条「[agentd] N 条新事件」注入，Router 一轮处理完。</td></tr>
 <tr><td>Inline &amp; Spill</td><td>注入的每条事件只带奏折头和 ≤300 字摘要，被截断时注明。全文留在库里。</td></tr>
 <tr><td>局部性 Inline</td><td>提问、受阻、失败、卡住、退出这几类事件额外带上该奏折<b>在它之前</b>的最后一条进展汇报（同样 ≤300 字），Router 转述时知道 Worker 做到哪了，不必先 <code>read</code>。就绪不带（它本身就是结果）；单个奏折的 <code>read events</code> 不带（进展已在列表里）。</td></tr>
-<tr><td>链式召回</td><td><code>read</code> 工具三跳：summary（任务原文、最近消息、待答问题；两者相同时只列待答问题；最近消息是你答过的问题时，下一行附「你答：…」，和面板一致）→ events（事件全文）→ transcript（Worker 会话尾部）。</td></tr>
+<tr><td>链式召回</td><td><code>read</code> 工具由浅到深：summary（任务、最近消息、待答问题；两者相同时只列待答问题；最近消息是你答过的问题时，下一行附「你答：…」，和面板一致）→ prompt（任务原文全文）/ events（事件全文）→ transcript（Worker 会话）。每一层都按 Inline &amp; Spill 返回，凡是截掉的部分都写明下一次 <code>read</code> 该带的参数，Router 照着读就行，不用猜：
+  <ul>
+    <li>summary 里的任务超过 1200 字就截断，附「共 N 字，read ticket=12 what=prompt 取全文」。</li>
+    <li>events 一页 50 条（<code>limit</code> 可调）。更早还有时，第一行写「更早还有：read … before=<i>事件 id</i>」。</li>
+    <li>transcript 一页 20 条，每条最多 600 字。截断的那条附「read … row=<i>N</i> 取全文」；更早还有时，同样给出 <code>before=</code>。</li>
+  </ul>
+  奏折之间也连成链。派工时带 <code>follows=旧号</code>，表示这张接着那张做；两张的 summary 互相列出（「接续自：#4 …」「后续：#9 …」），下一跳的号就在结果里。<code>find</code> 按关键词（标题、任务、最近消息）或项目查历史奏折，已结束的也在内，最新的在前。用户隔天提起旧任务时，Router 从这里进入这条链。</td></tr>
 <tr><td>长程记忆</td><td>事实源是 SQLite，不是 Router 的 transcript。会话首条消息附带奏折总览；compact 时追加「保留未结束奏折与单聊对象」的指令，压缩完成后的下一条消息重新附带一份从守护进程现取的总览，不靠摘要记住奏折状态。</td></tr>
 <tr><td>订阅直通（Fast Path）</td><td>单聊时你的话由插件直接送给 Worker（有待答问题就是答案，否则是追加指令），返回 <code>{ drop }</code> 不进 Router 模型，同时在 Router 对话里记一行「用户已直接回答 #12…」或「用户直接对 #12 的 Worker 说…」，保持 Router 的上下文完整。送不到时这句话改交 Router，并附上原因。</td></tr>
 <tr><td>Worker 不直接对人说话</td><td>Worker 的 <code>AskUserQuestion</code> 被禁用，系统提示要求只用三个 agentd 工具对外。</td></tr>
@@ -267,6 +273,10 @@ node packages/agentd/dist/agentd.mjs dispatch memos "加搜索框" "给列表加
   <li><b>权限模式要一致。</b>跨会话消息在接收方权限模式不同时会被扣下等批准。Router 与 Worker 都用 auto。</li>
   <li><b>守护进程的生命期。</b>插件以 <code>serve --detach</code> 启动它，它脱离会话独立运行；没有进行中的奏折且 30 分钟无请求时自行退出，下次打开 Router 时再被拉起。Worker 在它不在线时调用工具会得到「agentd 不在线」，<code>ask</code> 会自动重连等待。</li>
   <li><b>mod 的写法限制。</b>引擎静态分析 mod：不能把 <code>$</code> 作为参数传递，<code>atom</code> 的 plugin 名必须是字面量，同一事件不能注册两个无 matcher 的钩子，命令名不能与内置命令重名。</li>
+  <li><b>transcript 一条的号是它在文件里的字节偏移。</b>Claude Code 的会话 jsonl 只追加不改写，所以偏移稳定：<code>row=</code> 直接定位到那一行读，不用扫全文件。<code>before=</code> 从那个偏移往前、每次 1 MB 倒着读，凑够一页为止，不再受旧版「只看最后 1 MB」的限制。单行比 1 MB 还长的（巨大的工具结果）整行跳过，这种行本来也不显示文字。偏移不是行首时，<code>row=</code> 返回 404。</li>
+  <li><b><code>follows</code> 写错不挡派工。</b>写了一个不存在的号，奏折照样派出，只是不记接续关系；返回里附一句「没有 ticket #N，没记接续关系」让 Router 知道。<code>follows_id</code> 列没有加外键：派工时已经核对过，奏折也从不删除，而且 SQLite 里被外键用到的列以后再也删不掉。</li>
+  <li><b><code>find</code> 是 LIKE 扫表。</b>一张奏折对应一件你交代的事，表很小，建索引不划算。<code>%</code> 和 <code>_</code> 按普通字符匹配。</li>
+  <li><b>新插件配旧守护进程照样能读。</b>events 和 transcript 的返回从数组改成了 <code>{ events|rows, more }</code>。插件遇到旧守护进程回的数组照常显示，只是没有「更早还有」这一行。<code>find</code> 和 <code>row=</code> 需要新守护进程，碰到旧的会报「没有 GET …」，<code>/agentd restart</code> 换上新构建就好。</li>
   <li><b>直通的提示文案。</b>直通时引擎会显示一行「Prompt dropped by a hook: 已直通 #12 …」。这是引擎对 <code>{ drop }</code> 的固定前缀，不是出错。</li>
 </ul>
 
@@ -334,8 +344,12 @@ claude plugin test .  # mod 的测试：引擎替身 + 假守护进程</code></p
 POST /shutdown                   守护进程退出（插件 /agentd restart 用）
 GET  /projects                   POST /projects/rescan
 GET  /tickets?state=open|needs_me|recent|all
-POST /tickets                    { project, title, prompt, readonly?, model? }
-GET  /tickets/:id                GET  /tickets/:id/events?limit=   GET /tickets/:id/transcript?tail=
+POST /tickets                    { project, title, prompt, readonly?, model?, follows? }  follows 不存在时照样派，note 里说明
+GET  /tickets/search?q=&amp;project=&amp;limit=   历史奏折（含已结束），最新在前，limit ≤100
+GET  /tickets/:id                → 奏折 + prompt + follows（它接续的）+ followers（接续它的），后两者是 { id, title, project, state }
+GET  /tickets/:id/events?limit=&amp;before=事件id        → { events, more }
+GET  /tickets/:id/transcript?tail=&amp;before=字节偏移   → { rows: [{ role, text, tools, at, isCut }], more }
+GET  /tickets/:id/transcript/:at                       → 从字节偏移 at 开始的那一条全文
 GET  /activity                     （在干的奏折各自最后两行动作与时间）
                                  limit / tail 只接受 1–500 的整数，否则用默认值
 POST /tickets/:id/report         { summary }                ← Worker
@@ -429,7 +443,7 @@ pnpm --filter dsh-superagent install:dsh     # 复制到 ~/.dsh/profiles/desktop
   <li><b>Router 不执行</b>：preset <code>superagent-router</code> 只有 persona、time-context、compaction，没有 shell / fs / web 工具；插件再给它装 9 个路由工具。不能靠 <code>tools.restrict</code>：它只遮全局工具，preset 的工具遮不掉。</li>
   <li><b>Worker 是普通会话</b>：经 <code>sessionController.create</code> 创建，和你在界面里新建的会话一样归 controller 所有，插件重载不影响正在干的 Worker。会话 id 在创建前就写进奏折，<code>agent/created</code> 触发时就能认出它是哪张奏折。</li>
   <li><b>批处理</b>：需要人处理的事件（提问、就绪、受阻、失败、卡住、中断、启动失败）入队；1.5 秒内没有新事件、且 Router 空闲时，合并成一条「[superagent] N 条新事件」用 <code>followup</code> 开一轮。Router 正在推理时不打断，等 <code>agent/status</code> 变 idle。</li>
-  <li><b>Inline &amp; Spill 与链式召回</b>：每条事件 ≤300 字，截断时注明；交回类事件附此前最后一条进展。<code>superagent_read</code> 三跳：summary → events → transcript。summary 和总览里的「最近消息」与 agentd 同一规则（Worker 或插件说的最后一句，等你处理的提问或审批也算，另含 interrupted；你在 Worker 会话里说的话不算），与「在等你」相同时不重复。</li>
+  <li><b>Inline &amp; Spill 与链式召回</b>：每条事件 ≤300 字，截断时注明；交回类事件附此前最后一条进展。<code>superagent_read</code> 由浅到深：summary → task（任务全文）/ events → transcript。和 agentd 一样，截掉的部分都写明下一次该带的参数（<code>before</code>、<code>row</code>）；summary 列出接续关系（派工时带 <code>follows</code>）。旧奏折用 <code>superagent_list</code> 带 <code>query</code> / <code>project</code> 找，已结束的也在内。summary 和总览里的「最近消息」与 agentd 同一规则（Worker 或插件说的最后一句，等你处理的提问或审批也算，另含 interrupted；你在 Worker 会话里说的话不算），与「在等你」相同时不重复。</li>
   <li><b>提问与审批只镜像</b>：在 Worker 的 <code>user-questions/request</code>、<code>approval/request</code> 上挂一个只观察的监听，奏折进 asking，<code>next()</code> 结算后回 working。Router 不能替你批准。</li>
   <li><b>watchdog</b>：working 的 Worker 空闲超过 60 秒没调 done 记为卡住（受阻），附最后一个动作；插件启动时，working/asking 但会话已不在线的奏折记为中断。</li>
 </ul>
@@ -441,6 +455,7 @@ pnpm --filter dsh-superagent install:dsh     # 复制到 ~/.dsh/profiles/desktop
   <li><b>消息来源</b>：批量事件显示为「收到外部事件」（webhook 来源），Router 转给 Worker 的话显示为「收到任务消息」（agent-message 来源）。Worker 被要求不把后者当作权限批准。</li>
   <li><b>收与停</b>：收只结束奏折、停掉正在跑的一轮，会话保留；停可以恢复，恢复时 Worker 先只读自查、汇报、提问。</li>
   <li><b>只读奏折与 MR 奏折</b>：和 agentd 同一套（3.8），共用 <code>packages/agentd/src/lanes.ts</code> 与 <code>lane-rules.ts</code>。worktree 前缀是 <code>superagent</code>（<code>.claude/worktrees/superagent-&lt;id&gt;-&lt;戳&gt;</code>），和 agentd 的不会撞名。插件配置里 <code>projects: { "&lt;路径&gt;": { "delivery": "mr" } }</code> 指定 MR 项目。三点不同：派工时不做 3.8 的本地检查，也不认 <code>githubOwners</code>，规则 3 b 一律是 GitLab 版（偏差 P15）；只读奏折只有规则约束，并且照旧占用 local 项目（偏差 P2）；「放弃」二次确认在面板卡片上。</li>
+  <li><b>transcript 一条的号是行序号</b>：dsh 会话按消息块排成行（文字一行，工具调用一行），<code>row=</code> 和 <code>before=</code> 用的是这个序号。会话只追加时序号稳定；如果 dsh 压缩改写了会话，旧序号会对不上，那就重新读一次尾部（偏差 R2）。</li>
   <li><b>尚未在真 dsh 里跑过</b>：单元测试和接线测试用的是按安装版接口写的模拟 ctx。装上之后需要确认的点列在 implementation-notes 的 spike 结论里（S1、S3–S7）。</li>
 </ul>
 

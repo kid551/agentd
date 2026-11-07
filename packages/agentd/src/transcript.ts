@@ -10,7 +10,7 @@ import {
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
-import type { TranscriptRow } from './types.js'
+import type { TranscriptPage, TranscriptRow } from './types.js'
 
 export function projectsDir(env: NodeJS.ProcessEnv = process.env): string {
   return join(env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude'), 'projects')
@@ -59,31 +59,105 @@ function tail(file: string, bytes: number): string {
 
 type Block = { type?: string; text?: string; name?: string }
 
-/** The conversation's last `limit` rows a person would read: prompts, answers, tool names. */
-export function readTail(file: string, limit = 20, charsPerRow = 600): TranscriptRow[] {
-  const rows: TranscriptRow[] = []
-  for (const line of tail(file, 1024 * 1024).split('\n')) {
-    if (!line.trim()) continue
-    let entry: { type?: string; isMeta?: boolean; message?: { content?: string | Block[] } }
-    try {
-      entry = JSON.parse(line)
-    } catch {
-      continue
-    }
-    if ((entry.type !== 'user' && entry.type !== 'assistant') || entry.isMeta) continue
-    const content = entry.message?.content
-    const blocks: Block[] =
-      typeof content === 'string' ? [{ type: 'text', text: content }] : (content ?? [])
-    const text = blocks
-      .filter(b => b.type === 'text' && b.text)
-      .map(b => b.text as string)
-      .join('\n')
-      .trim()
-    const tools = blocks.filter(b => b.type === 'tool_use' && b.name).map(b => b.name as string)
-    if (!text && tools.length === 0) continue
-    rows.push({ role: entry.type, text: text.slice(0, charsPerRow), tools })
+/** One transcript line as a row a person would read; null for meta, tool results and the like. */
+function parseRow(line: string, at: number, charsPerRow: number): TranscriptRow | null {
+  if (!line.trim()) return null
+  let entry: { type?: string; isMeta?: boolean; message?: { content?: string | Block[] } }
+  try {
+    entry = JSON.parse(line)
+  } catch {
+    return null
   }
-  return rows.slice(-limit)
+  if ((entry.type !== 'user' && entry.type !== 'assistant') || entry.isMeta) return null
+  const content = entry.message?.content
+  const blocks: Block[] =
+    typeof content === 'string' ? [{ type: 'text', text: content }] : (content ?? [])
+  const text = blocks
+    .filter(b => b.type === 'text' && b.text)
+    .map(b => b.text as string)
+    .join('\n')
+    .trim()
+  const tools = blocks.filter(b => b.type === 'tool_use' && b.name).map(b => b.name as string)
+  if (!text && tools.length === 0) return null
+  return {
+    role: entry.type,
+    text: text.slice(0, charsPerRow),
+    tools,
+    at,
+    isCut: text.length > charsPerRow,
+  }
+}
+
+const CHUNK = 1024 * 1024
+
+/**
+ * The conversation's last `limit` rows a person would read (prompts, answers,
+ * tool names) ending before byte `before`, each cut to `charsPerRow`. Reads the
+ * file backwards a chunk at a time until it has them. A line longer than a
+ * chunk (a huge tool result) is skipped: it holds nothing shown here.
+ */
+export function readRows(
+  file: string,
+  options: { limit?: number; before?: number; charsPerRow?: number } = {},
+): TranscriptPage {
+  const limit = options.limit ?? 20
+  const charsPerRow = options.charsPerRow ?? 600
+  const fd = openSync(file, 'r')
+  try {
+    let stop = Math.min(options.before ?? Infinity, fstatSync(fd).size)
+    let rows: TranscriptRow[] = []
+    while (stop > 0 && rows.length <= limit) {
+      const start = Math.max(0, stop - CHUNK)
+      const buffer = Buffer.alloc(stop - start)
+      readSync(fd, buffer, 0, buffer.length, start)
+      // Before the first newline is the end of a line the next chunk back holds.
+      const from = start === 0 ? 0 : buffer.indexOf(0x0a) + 1
+      // No line starts in this chunk: it is the middle of a line longer than a chunk.
+      if (start > 0 && (from === 0 || from === buffer.length)) {
+        stop = start
+        continue
+      }
+      const found: TranscriptRow[] = []
+      for (let i = from; i < buffer.length;) {
+        const nl = buffer.indexOf(0x0a, i)
+        const j = nl === -1 ? buffer.length : nl
+        const row = parseRow(buffer.toString('utf8', i, j), start + i, charsPerRow)
+        if (row) found.push(row)
+        i = j + 1
+      }
+      rows = [...found, ...rows]
+      stop = start + from
+    }
+    return { rows: rows.slice(-limit), more: rows.length > limit }
+  } finally {
+    closeSync(fd)
+  }
+}
+
+/** The whole row starting at byte `at`; null when no row a person would read starts there. */
+export function readRow(file: string, at: number): TranscriptRow | null {
+  const fd = openSync(file, 'r')
+  try {
+    const size = fstatSync(fd).size
+    if (!Number.isInteger(at) || at < 0 || at >= size) return null
+    if (at > 0) {
+      const prev = Buffer.alloc(1)
+      readSync(fd, prev, 0, 1, at - 1)
+      if (prev[0] !== 0x0a) return null
+    }
+    const parts: Buffer[] = []
+    for (let pos = at; pos < size;) {
+      const buffer = Buffer.alloc(Math.min(CHUNK, size - pos))
+      readSync(fd, buffer, 0, buffer.length, pos)
+      const nl = buffer.indexOf(0x0a)
+      parts.push(nl === -1 ? buffer : buffer.subarray(0, nl))
+      if (nl !== -1) break
+      pos += buffer.length
+    }
+    return parseRow(Buffer.concat(parts).toString('utf8'), at, Infinity)
+  } finally {
+    closeSync(fd)
+  }
 }
 
 type ToolBlock = { type?: string; text?: string; name?: string; input?: Record<string, unknown> }

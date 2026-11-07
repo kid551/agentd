@@ -80,6 +80,11 @@ const MIGRATIONS: string[] = [
    ALTER TABLE tickets ADD COLUMN mr_opened_at INTEGER;`,
   // The person's answer to the question that is the ticket's latest message.
   `ALTER TABLE tickets ADD COLUMN last_answer TEXT;`,
+  // The earlier ticket this one carries on (chain of recall: one hop back, and its followers forward).
+  // No REFERENCES: dispatch checks it, tickets are never deleted, and a column in
+  // a foreign key could never be dropped again.
+  `ALTER TABLE tickets ADD COLUMN follows_id INTEGER;
+   CREATE INDEX tickets_follows ON tickets (follows_id) WHERE follows_id IS NOT NULL;`,
 ]
 
 type TicketRow = {
@@ -101,6 +106,7 @@ type TicketRow = {
   worker_bg_id: string | null
   last_report: string | null
   last_answer: string | null
+  follows_id: number | null
   created_at: number
   updated_at: number
   ended_at: number | null
@@ -298,13 +304,15 @@ export class Store {
     model: string
     worktree: boolean
     readonly?: boolean
+    /** Must name an existing ticket; the caller checks. */
+    followsId?: number
   }): TicketView {
     return this.tx(() => {
       const at = this.now()
       const { lastInsertRowid } = this.db
         .prepare(
-          `INSERT INTO tickets (title, project_id, cwd, prompt, state, worktree, readonly, model, created_at, updated_at)
-           VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)`,
+          `INSERT INTO tickets (title, project_id, cwd, prompt, state, worktree, readonly, model, follows_id, created_at, updated_at)
+           VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           input.title,
@@ -314,6 +322,7 @@ export class Store {
           input.worktree ? 1 : 0,
           input.readonly ? 1 : 0,
           input.model,
+          input.followsId ?? null,
           at,
           at,
         )
@@ -347,20 +356,54 @@ export class Store {
     return this.rows(`WHERE ${where}`, args)
   }
 
+  /**
+   * Tickets ended or not, newest first: those whose title, task or latest
+   * message holds `query`, in a project whose id holds `project`. A LIKE scan:
+   * the table holds one row per task a person gave, so no index pays for itself.
+   */
+  searchTickets(filter: { query?: string; project?: string; limit?: number }): TicketView[] {
+    const like = (s: string): string => `%${s.replace(/[\\%_]/g, c => `\\${c}`)}%`
+    const where: string[] = []
+    const args: string[] = []
+    const query = filter.query?.trim()
+    if (query) {
+      where.push(
+        `(t.title LIKE ?1 ESCAPE '\\' OR t.prompt LIKE ?1 ESCAPE '\\' OR t.last_report LIKE ?1 ESCAPE '\\')`,
+      )
+      args.push(like(query))
+    }
+    const project = filter.project?.trim()
+    if (project) {
+      where.push(`t.project_id LIKE ?${args.length + 1} ESCAPE '\\'`)
+      args.push(like(project))
+    }
+    const limit = Math.max(1, Math.min(filter.limit ?? 20, 100))
+    return this.rows(
+      where.length ? `WHERE ${where.join(' AND ')}` : '',
+      args,
+      `ORDER BY t.id DESC LIMIT ${limit}`,
+    )
+  }
+
+  /** The tickets that carry this one on, oldest first. */
+  followersOf(id: number): TicketView[] {
+    return this.rows('WHERE t.follows_id = ?', [id])
+  }
+
   ticketsInState(states: readonly TicketState[]): TicketView[] {
     const marks = states.map(() => '?').join(', ')
     return this.rows(`WHERE state IN (${marks})`, [...states])
   }
 
   /** Tickets matching `where`, each with its open question, in one query. */
-  private rows(where: string, args: (string | number)[]): TicketView[] {
+  private rows(where: string, args: (string | number)[], order = 'ORDER BY t.id'): TicketView[] {
     const rows = this.db
       .prepare(
         `SELECT t.*, q.id AS q_id, q.kind AS q_kind, q.question AS q_question,
                 q.options AS q_options, q.asked_at AS q_asked_at
          FROM tickets t
          LEFT JOIN questions q ON q.ticket_id = t.id AND q.answered_at IS NULL
-         ${where} ORDER BY t.id`,
+         ${where} ${order}`,
       )
       .all(...args) as (TicketRow & OpenQuestionCols)[]
     return rows.map(r => this.view(r))
@@ -518,15 +561,20 @@ export class Store {
     return rows.map(r => this.eventView(r))
   }
 
-  eventsOf(ticketId: number, limit = 50): (EventView & { body: EventBody })[] {
+  /** A ticket's last `limit` events, oldest first; with `before`, those older than that event id. */
+  eventsOf(
+    ticketId: number,
+    limit = 50,
+    before = Number.MAX_SAFE_INTEGER,
+  ): (EventView & { body: EventBody })[] {
     const rows = this.db
       .prepare(
         `SELECT * FROM (
            SELECT e.*, t.title, t.project_id FROM events e JOIN tickets t ON t.id = e.ticket_id
-           WHERE e.ticket_id = ? ORDER BY e.id DESC LIMIT ?
+           WHERE e.ticket_id = ? AND e.id < ? ORDER BY e.id DESC LIMIT ?
          ) ORDER BY id`,
       )
-      .all(ticketId, limit) as EventRow[]
+      .all(ticketId, before, limit) as EventRow[]
     return rows.map(r => ({ ...this.eventView(r), body: JSON.parse(r.body) as EventBody }))
   }
 
@@ -630,6 +678,7 @@ export class Store {
       workerBgId: row.worker_bg_id,
       lastReport: row.last_report,
       lastAnswer: row.last_answer,
+      followsId: row.follows_id,
       openQuestion:
         row.q_id !== null
           ? {
