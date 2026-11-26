@@ -398,9 +398,11 @@ export class Daemon {
         )
       if (holder) return refuse(`${ticket.project} 正被 #${holder.id} 占用，先收或停掉它`)
     }
-    const active = this.store.ticketsInState(ACTIVE).length + this.launching.size
-    if (active >= this.config.worker.maxConcurrent) {
-      return refuse(`Worker 已满（${this.config.worker.maxConcurrent} 个），等一个结束再恢复`)
+    const pool = poolOf(ticket)
+    if (this.slotsUsed()[pool] >= this.slotLimit(pool)) {
+      return refuse(
+        `${pool === 'readonly' ? '只读 ' : ''}Worker 已满（${this.slotLimit(pool)} 个），等一个结束再恢复`,
+      )
     }
     return this.relaunch(
       ticket,
@@ -736,9 +738,24 @@ export class Daemon {
     }
   }
 
+  /** Slots taken in each pool: Workers running a turn, and those being started. */
+  private slotsUsed(): Record<Pool, number> {
+    const used: Record<Pool, number> = { write: 0, readonly: 0 }
+    for (const t of this.store.ticketsInState(ACTIVE))
+      if (takesSlot(t) && !this.launching.has(t.id)) used[poolOf(t)]++
+    for (const id of this.launching) {
+      const t = this.store.ticket(id)
+      if (t) used[poolOf(t)]++
+    }
+    return used
+  }
+
+  private slotLimit(pool: Pool): number {
+    return pool === 'readonly' ? this.config.worker.maxReadonly : this.config.worker.maxConcurrent
+  }
+
   private launchQueued(): void {
-    const active = this.store.ticketsInState(ACTIVE)
-    let slots = this.config.worker.maxConcurrent - active.length - this.launching.size
+    const used = this.slotsUsed()
     // A ticket keeps its project until closed or stopped: its Worker may still
     // hold uncommitted work there, and a message can set it going again.
     const busy = new Set(
@@ -754,10 +771,12 @@ export class Daemon {
     }
     for (const ticket of this.store.ticketsInState(['queued'])) {
       if (this.launching.has(ticket.id)) continue
-      if (slots <= 0) break
+      const pool = poolOf(ticket)
+      // A full pool skips its tickets; the other pool's may still start.
+      if (used[pool] >= this.slotLimit(pool)) continue
       if (holdsProject(ticket) && busy.has(ticket.project)) continue
       if (holdsProject(ticket)) busy.add(ticket.project)
-      slots--
+      used[pool]++
       this.launching.add(ticket.id)
       void this.launch(ticket).finally(() => this.launching.delete(ticket.id))
     }
@@ -867,3 +886,16 @@ export const READONLY_REFUSED = ['Edit', 'Write', 'NotebookEdit']
 
 /** Writes in the project folder itself: one such ticket per project at a time. */
 const holdsProject = (t: TicketView): boolean => !t.worktree && !t.readonly
+
+/** Readonly tickets count against `maxReadonly`, writing ones against `maxConcurrent`. */
+type Pool = 'write' | 'readonly'
+const poolOf = (t: TicketView): Pool => (t.readonly ? 'readonly' : 'write')
+
+/**
+ * A live ticket whose Worker is running a turn. An `ask` returns at once and
+ * the Worker ends its turn to wait, so it gives its slot up; a permission
+ * question is asked by a hook that holds the Worker's turn open until the
+ * answer, so that Worker keeps its slot.
+ */
+const takesSlot = (t: TicketView): boolean =>
+  t.state === 'working' || (t.state === 'asking' && t.openQuestion?.kind === 'permission')
