@@ -155,7 +155,7 @@ node packages/agentd/dist/agentd.mjs dispatch memos "加搜索框" "给列表加
 <h3>2.2 奏折状态</h3>
 <table>
 <tr><th>状态</th><th>含义</th><th>面板分组</th></tr>
-<tr><td>queued</td><td>排队：local 项目里已有写入 Worker 在跑，或并发已满</td><td>进行中</td></tr>
+<tr><td>queued</td><td>排队：local 项目里已有写入 Worker 在跑，或它所在的名额池（写入 / 只读）已满（3.8）</td><td>进行中</td></tr>
 <tr><td>working</td><td>Worker 在干</td><td>进行中</td></tr>
 <tr><td>asking</td><td>有待答问题。普通提问时 Worker 不停：做只读准备或结束本轮；权限请求时 Worker 停在钩子里等</td><td>待我处理</td></tr>
 <tr><td>ready</td><td>Worker 交付，待验收</td><td>待我处理</td></tr>
@@ -236,7 +236,13 @@ node packages/agentd/dist/agentd.mjs dispatch memos "加搜索框" "给列表加
 <tr><td>MR 项目里的写入奏折</td><td>自己的 worktree <code>&lt;项目&gt;/.claude/worktrees/agentd-&lt;id&gt;-&lt;戳&gt;</code>，分支 <code>agentd/&lt;id&gt;-&lt;戳&gt;</code>，从最新 origin/main 拉出</td><td>不占</td><td>待审 → 开 MR → 合入后自动结束并清理；或「放弃」</td></tr>
 <tr><td>local 项目里的写入奏折</td><td>项目主目录、当前分支</td><td>占，到收或停为止</td><td>ready → 收（不变）</td></tr>
 </table>
-<p>哪些项目是 MR 项目，由 <code>~/.agentd/config.json</code> 的 <code>projects</code> 按路径指定（6.1），没写的都是 local。只读奏折和 MR 奏折都照样受 <code>maxConcurrent</code> 限制。</p>
+<p>哪些项目是 MR 项目，由 <code>~/.agentd/config.json</code> 的 <code>projects</code> 按路径指定（6.1），没写的都是 local。</p>
+<p><b>Worker 名额分两个池子</b>（<code>daemon.ts</code> 的 <code>slotsUsed</code> / <code>takesSlot</code> / <code>poolOf</code>）：只读奏折只占 <code>worker.maxReadonly</code>（默认 5），写入奏折（local 和 MR 都算）只占 <code>worker.maxConcurrent</code>（默认 20）。一个池子满了只挡它自己的排队奏折，另一个池子的照样启动；只读池满了也不借写入池的空位。</p>
+<ul>
+  <li><b>只有正在跑一轮的 Worker 占名额</b>：working 的，加上挂着权限请求的 asking 的。<code>ask</code> 立即返回、Worker 随即结束本轮等回答，所以普通提问的 asking 不占名额；权限请求是钩子发起的，钩子一直等到你答，Worker 那一轮其实没结束，所以照占（按待答问题的 <code>kind = 'permission'</code> 区分）。正在启动的奏折（<code>launching</code>，含恢复、重启）也算，同一张不重复计。</li>
+  <li><b>排队和恢复都查名额</b>：<code>launchQueued</code> 拉起排队奏折、<code>resume</code> 恢复已停奏折时按它所在的池子检查，满了就排着或拒绝（「Worker 已满」/「只读 Worker 已满」）。</li>
+  <li><b>把奏折拉回 working 的其他路径不查名额</b>：回答一个普通提问、追加消息（<code>message</code>）、开 MR（<code>openMr</code>）、受阻/失败后重试或单聊里直接说话（<code>retry</code> / <code>say</code>，走 <code>relaunch</code>）。这些都是你本人在叫一张已有 Worker 的奏折接着干，不该被排队挡住，代价是那一刻在跑的 Worker 可能短时超过上限；之后的排队奏折会等它们降下来。</li>
+</ul>
 <p>配成 mr 的项目，派工时守护进程还要在本地看一眼仓库（<code>lanes.ts</code> 的 <code>probeOrigin</code> / <code>whyLocal</code>，只读本地，不联网）：没有 origin、本地没有 <code>origin/main</code>、或 origin 在 github.com 上而 owner 不在 <code>githubOwners</code> 里，这张写入奏折就退回 local（主目录、串行），Router 拿到的派工结果后面附一句原因。所以整个 GitHub 目录设成 mr 也安全：master 分支的、没远端的、别人项目的克隆都照旧串行。已派出的奏折不受影响，它是不是 MR 奏折在派工那一刻定下。</p>
 <p>MR 奏折的一生：</p>
 <ol>
@@ -292,7 +298,7 @@ claude plugin test .  # mod 的测试：引擎替身 + 假守护进程</code></p
 <tr><th>测试</th><th>覆盖</th></tr>
 <tr><td><code>state.test.ts</code></td><td>状态机穷举：8 个状态 × 15 个输入，每格都写明结果</td></tr>
 <tr><td><code>store.test.ts</code></td><td>事务原子性、问答往返、离开 asking 自动撤回、重开、截断、迁移、项目重命名、列表过滤与未答问题联查、最近消息与其下的「你答」（权限只记批准/拒绝、只回选项号时换成选项全文、截断、新消息清掉、追加指令不清）</td></tr>
-<tr><td><code>daemon.test.ts</code></td><td>派工、同项目串行（占到 close）、并发上限、启动失败与重试、恢复（会话、占用、并发、目录、启动中不撞项目）、stalled、进程消失（无 pid）、停止、撤回等待者、长轮询、回答是否需要插件代发（普通提问要，权限请求不要）；开 MR 在交付说明下记「你答：开 MR」，追加指令、停、恢复、收不记；activity 只给在干的奏折</td></tr>
+<tr><td><code>daemon.test.ts</code></td><td>派工、同项目串行（占到 close）、并发上限（普通提问让出名额、权限请求不让；只读池与写入池互不占用、不借用）、启动失败与重试、恢复（会话、占用、并发与名额池、目录、启动中不撞项目）、stalled、进程消失（无 pid）、停止、撤回等待者、长轮询、回答是否需要插件代发（普通提问要，权限请求不要）；开 MR 在交付说明下记「你答：开 MR」，追加指令、停、恢复、收不记；activity 只给在干的奏折</td></tr>
 <tr><td><code>http-mcp.test.ts</code></td><td>HTTP + MCP 端到端：派工 → 汇报 → 提问（立即返回，第二问被拒）→ 回答 → 交付 → 关闭</td></tr>
 <tr><td><code>projects.test.ts</code> · <code>claude.test.ts</code></td><td>扫描与命名、解析歧义；参数顺序、输出解析、transcript 读取；最近动作（工具按「做什么」显示、截成一行、文件变大才重读）</td></tr>
 <tr><td><code>router-mod/tests/router.test.tsx</code></td><td>非 Router 目录不生效；工具与命令注册；band 文案与底色；单聊（回答、追加指令、送不到改交 Router、自动单聊答完即止、自己开的单聊交付后回 Router 或交给排队的提问、受阻时保持）；回答一个提问时其他奏折的事件全部排队、答完单聊交给下一个提问；Router 回复按奏折切分、每段画进项目色的框；禁 Bash/Read/WebFetch；message 先送达再记录；派工；面板点「单聊」时用 <code>$.ui.log</code> 插一行短提示（不含卡片内容）、退出时插「已结束单聊」；<code>mentionDepth</code> 数往上第几条 Router 回复讲到它；单聊中的奏折在 Router 回复里的段落框成橙色并标「▶ 单聊中」，退出后变回状态色；面板分组与按钮、编号徽标与项目标签、汇报与问题以 Markdown 全文画出、小标题叫「最近消息」；read summary 的最近消息不与待答问题重复；答过的问题在卡片与 read summary 里附「你答：」；状态色、项目色与「几分钟前」；停止二次确认；批处理注入与自动单聊；压缩后重发奏折总览；权限请求的批准/拒绝按钮；受阻奏折的重试；已停奏折的「恢复」按钮（已收的没有）；「已结束」按编号倒序、每页 10 张翻页与对已停奏折发消息的提示；单聊受阻奏折时你的话走 say（Router 转达的不走）；「打开」对活 Worker 用 iTerm2 attach、对已结束的用 VSCode；在干的卡片在「最近消息」下面以「实时动作」为小标题显示最后两行动作与「几秒前」、久无动作变黄、没有在干的就不请求 /activity；「复制」的全文（问题、可选项、最近消息原文、你答）、复制到按下的那个 surface、复制失败的提示，已结束的奏折没有这个按钮；长消息的下限行数估算（块数、软换行、表格分隔行、代码块、CJK 与标记的宽度、还没测宽时只看块数），折叠成四行、截断处唯一的「… 展开全文 / 收起」开关；卡片按钮的主次分层（各状态的主操作、复制/停/放弃是暗色链接）与「确认放弃 / 确认停止」的警告行，问题不折叠，来了新消息或重载后恢复折叠</td></tr>
@@ -323,7 +329,7 @@ claude plugin test .  # mod 的测试：引擎替身 + 假守护进程</code></p
   "roots": ["~/code"],
   "port": 7707,
   "scanDepth": 3,
-  "worker": { "model": "opus", "permissionMode": "auto", "maxConcurrent": 4 },
+  "worker": { "model": "opus", "permissionMode": "auto", "maxConcurrent": 20, "maxReadonly": 5 },
   "router": { "inlineChars": 300 },
   "stallSeconds": 45,
   "idleExitSeconds": 0,
@@ -335,6 +341,7 @@ claude plugin test .  # mod 的测试：引擎替身 + 假守护进程</code></p
   "githubOwners": ["kid551"]
 }</code></pre>
 <p><code>projects</code> 指定交付方式：<code>mr</code> 的项目里写入奏折各开 worktree、走 MR；<code>local</code> 的在主目录串行。key 可以是一个仓库，也可以是一个文件夹（下面所有仓库都算），可写 <code>~</code>；一个仓库被几个 key 覆盖时，离它最近的那个说了算，所以文件夹设成 mr、里面个别仓库再单独写成 local 即可。按整段路径比较：<code>…/acme</code> 不会覆盖 <code>…/acme-flutter</code>。没有任何 key 覆盖的仓库用 <code>defaultDelivery</code>（默认 <code>local</code>）。合并分支固定是 <code>main</code>：配成 mr 的仓库若没有 origin 或本地没有 <code>origin/main</code>，派工时自动按 local 处理（3.8），不必逐个写例外。</p>
+<p><code>worker.maxConcurrent</code>：同时在跑的写入 Worker 上限（默认 20）；<code>worker.maxReadonly</code>：同时在跑的只读 Worker 上限（默认 5）。两个池子各算各的，等你回答普通提问的奏折不占名额（3.8）。只写其中一项时另一项保持默认。改完要重启守护进程（<code>pnpm daemon:restart</code>）才生效；重启会影响正在跑的 Worker，挑没有要紧活的时候做。</p>
 <p><code>githubOwners</code>：你能推送的 GitHub 账号或组织（不分大小写）。写了它，github.com 上 owner 不在名单里的仓库即使配成 mr 也按 local，免得在别人项目的克隆里开出推不上去的 MR；不写或写空数组则不限制。GitLab 等其他主机不受它影响。</p>
 <p>环境变量：<code>AGENTD_HOME</code> 改状态目录（默认 <code>~/.agentd</code>），<code>AGENTD_PORT</code> 改插件连接的端口，<code>AGENTD_ROUTER=1</code> 让任意目录成为 Router，<code>AGENTD_CLAUDE</code> 指定 claude 可执行文件。</p>
 

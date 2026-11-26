@@ -82,6 +82,54 @@ describe('the queue', () => {
     expect(runtime.spawns).toHaveLength(2)
   })
 
+  test('a Worker waiting on an ask gives its slot up', async () => {
+    const { daemon, runtime, store } = world({ worker: { maxConcurrent: 1 } })
+    daemon.dispatch({ project: 'memos', title: 'a', prompt: 'p' })
+    daemon.dispatch({ project: 'acme', title: 'b', prompt: 'p' })
+    await settle(daemon)
+    expect(runtime.spawns.map(s => s.name)).toEqual(['agentd-w-1'])
+    daemon.ask(1, '用哪个方案？', ['A', 'B'])
+    await settle(daemon)
+    expect(runtime.spawns.map(s => s.name)).toEqual(['agentd-w-1', 'agentd-w-2'])
+    expect(store.ticket(2)?.state).toBe('working')
+  })
+
+  test('a Worker waiting on a permission question keeps its slot: its turn is still open', async () => {
+    const { daemon, runtime, store } = world({ worker: { maxConcurrent: 1 } })
+    daemon.dispatch({ project: 'memos', title: 'a', prompt: 'p' })
+    daemon.dispatch({ project: 'acme', title: 'b', prompt: 'p' })
+    await settle(daemon)
+    daemon.ask(1, '要跑 git commit', ['批准', '拒绝'], { grantKey: 'k' })
+    await settle(daemon)
+    expect(runtime.spawns).toHaveLength(1)
+    expect(store.ticket(2)?.state).toBe('queued')
+  })
+
+  test('readonly tickets have their own pool: a full writing pool does not hold them', async () => {
+    const { daemon, runtime, store } = world({ worker: { maxConcurrent: 1, maxReadonly: 2 } })
+    daemon.dispatch({ project: 'memos', title: 'a', prompt: 'p' })
+    daemon.dispatch({ project: 'acme', title: 'b', prompt: 'p' })
+    for (const project of ['memos', 'acme', 'billboard'])
+      daemon.dispatch({ project, title: 'r', prompt: 'p', readonly: true })
+    await settle(daemon)
+    expect(runtime.spawns.map(s => s.name)).toEqual(['agentd-w-1', 'agentd-w-3', 'agentd-w-4'])
+    expect(store.ticket(2)?.state).toBe('queued')
+    expect(store.ticket(5)?.state).toBe('queued')
+  })
+
+  test('a full readonly pool does not borrow a free writing slot', async () => {
+    const { daemon, runtime, store } = world({ worker: { maxReadonly: 1 } })
+    daemon.dispatch({ project: 'memos', title: 'r1', prompt: 'p', readonly: true })
+    daemon.dispatch({ project: 'acme', title: 'r2', prompt: 'p', readonly: true })
+    daemon.dispatch({ project: 'billboard', title: 'w', prompt: 'p' })
+    await settle(daemon)
+    expect(runtime.spawns.map(s => s.name)).toEqual(['agentd-w-1', 'agentd-w-3'])
+    expect(store.ticket(2)?.state).toBe('queued')
+    daemon.done(1, 'ready', '查完了')
+    await settle(daemon)
+    expect(store.ticket(2)?.state).toBe('working')
+  })
+
   test('a launch that fails fails the ticket with the reason; retry queues it again', async () => {
     const { daemon, runtime, store } = world()
     runtime.next = spec => ({
@@ -236,6 +284,21 @@ describe('resume', () => {
       reason: expect.stringContaining('Worker 已满'),
     })
     expect(runtime.spawns).toHaveLength(2)
+  })
+
+  test('resume counts a Worker waiting on an ask as free, and readonly ones in their own pool', async () => {
+    const { daemon, runtime } = await stopped({ worker: { maxConcurrent: 1, maxReadonly: 1 } })
+    daemon.dispatch({ project: 'acme', title: 'b', prompt: 'p' })
+    daemon.dispatch({ project: 'billboard', title: 'r', prompt: 'p', readonly: true })
+    await settle(daemon)
+    expect(runtime.spawns).toHaveLength(3)
+    const refused = await daemon.resume(1)
+    expect(refused).toMatchObject({ ok: false, reason: expect.stringContaining('Worker 已满') })
+    expect(refused.ok ? '' : refused.reason).not.toContain('只读')
+    // #2 now waits on the person; the readonly #3 still running is in the other pool.
+    daemon.ask(2, '用哪个方案？', null)
+    expect((await daemon.resume(1)).ok).toBe(true)
+    expect(runtime.spawns).toHaveLength(4)
   })
 
   test('a folder that is gone is refused, not relaunched into nothing', async () => {
@@ -609,8 +672,7 @@ describe('MR tickets', () => {
 
   test('writing tickets of one project each get a lane and run side by side', async () => {
     const { daemon, runtime, lanes, store, root } = world({}, ['acme'])
-    for (const title of ['a', 'b', 'c'])
-      daemon.dispatch({ project: 'acme', title, prompt: 'p' })
+    for (const title of ['a', 'b', 'c']) daemon.dispatch({ project: 'acme', title, prompt: 'p' })
     await settle(daemon)
     expect(runtime.spawns.map(s => s.name)).toEqual(['agentd-w-1', 'agentd-w-2', 'agentd-w-3'])
     const t = store.ticket(1)!

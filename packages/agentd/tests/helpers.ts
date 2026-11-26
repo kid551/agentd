@@ -92,9 +92,13 @@ export type World = {
 
 /**
  * A daemon over a temp folder with three repositories and a controllable
- * clock. `mr` names the projects whose delivery is `mr`.
+ * clock. `mr` names the projects whose delivery is `mr`; `worker` fields not
+ * given keep their defaults.
  */
-export function world(config: Partial<Config> = {}, mr: string[] = []): World {
+export function world(
+  config: Partial<Omit<Config, 'worker'>> & { worker?: Partial<Config['worker']> } = {},
+  mr: string[] = [],
+): World {
   const home = realpathSync(mkdtempSync(join(tmpdir(), 'agentd-test-')))
   const root = join(home, 'repos')
   for (const name of ['memos', 'acme', 'billboard'])

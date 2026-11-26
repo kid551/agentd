@@ -156,7 +156,8 @@ const DEFAULTS = {
 	worker: {
 		model: "opus",
 		permissionMode: "auto",
-		maxConcurrent: 4
+		maxConcurrent: 20,
+		maxReadonly: 5
 	},
 	router: { inlineChars: 300 },
 	stallSeconds: 45,
@@ -1260,7 +1261,8 @@ var Daemon = class {
 			const holder = this.store.ticketsInState(OCCUPYING).find((t) => t.id !== ticketId && holdsProject(t) && t.workerBgId && t.project === ticket.project);
 			if (holder) return refuse(`${ticket.project} 正被 #${holder.id} 占用，先收或停掉它`);
 		}
-		if (this.store.ticketsInState(ACTIVE).length + this.launching.size >= this.config.worker.maxConcurrent) return refuse(`Worker 已满（${this.config.worker.maxConcurrent} 个），等一个结束再恢复`);
+		const pool = poolOf(ticket);
+		if (this.slotsUsed()[pool] >= this.slotLimit(pool)) return refuse(`${pool === "readonly" ? "只读 " : ""}Worker 已满（${this.slotLimit(pool)} 个），等一个结束再恢复`);
 		return this.relaunch(ticket, ticket.workerSessionId, `【agentd ticket #${ticket.id} 恢复】用户中途停止过你，现在 agentd 接着你原来的会话重新启动了你（被自动审查拒绝的操作会转给用户批准）。停下时你可能正做到某一步的中途，现场可能是半途状态。\n\n1. 先只读自查：你最后在做的那一步实际做到了哪里，相关的 git、远端、部署等外部状态现在是什么样。\n2. 用 report 汇报做到哪了、还剩什么。\n3. 再用 ask 问用户下一步怎么做，然后结束本轮等回答（不要调用 done）。\n\n得到回答之前不做任何写操作：不改文件、不提交、不推送、不部署。`, "恢复", "resume");
 	}
 	/**
@@ -1553,9 +1555,24 @@ var Daemon = class {
 			}
 		}
 	}
+	/** Slots taken in each pool: Workers running a turn, and those being started. */
+	slotsUsed() {
+		const used = {
+			write: 0,
+			readonly: 0
+		};
+		for (const t of this.store.ticketsInState(ACTIVE)) if (takesSlot(t) && !this.launching.has(t.id)) used[poolOf(t)]++;
+		for (const id of this.launching) {
+			const t = this.store.ticket(id);
+			if (t) used[poolOf(t)]++;
+		}
+		return used;
+	}
+	slotLimit(pool) {
+		return pool === "readonly" ? this.config.worker.maxReadonly : this.config.worker.maxConcurrent;
+	}
 	launchQueued() {
-		const active = this.store.ticketsInState(ACTIVE);
-		let slots = this.config.worker.maxConcurrent - active.length - this.launching.size;
+		const used = this.slotsUsed();
 		const busy = new Set(this.store.ticketsInState(OCCUPYING).filter((t) => holdsProject(t) && t.workerBgId).map((t) => t.project));
 		for (const id of this.launching) {
 			const t = this.store.ticket(id);
@@ -1563,10 +1580,11 @@ var Daemon = class {
 		}
 		for (const ticket of this.store.ticketsInState(["queued"])) {
 			if (this.launching.has(ticket.id)) continue;
-			if (slots <= 0) break;
+			const pool = poolOf(ticket);
+			if (used[pool] >= this.slotLimit(pool)) continue;
 			if (holdsProject(ticket) && busy.has(ticket.project)) continue;
 			if (holdsProject(ticket)) busy.add(ticket.project);
-			slots--;
+			used[pool]++;
 			this.launching.add(ticket.id);
 			this.launch(ticket).finally(() => this.launching.delete(ticket.id));
 		}
@@ -1660,6 +1678,14 @@ const READONLY_REFUSED = [
 ];
 /** Writes in the project folder itself: one such ticket per project at a time. */
 const holdsProject = (t) => !t.worktree && !t.readonly;
+const poolOf = (t) => t.readonly ? "readonly" : "write";
+/**
+* A live ticket whose Worker is running a turn. An `ask` returns at once and
+* the Worker ends its turn to wait, so it gives its slot up; a permission
+* question is asked by a hook that holds the Worker's turn open until the
+* answer, so that Worker keeps its slot.
+*/
+const takesSlot = (t) => t.state === "working" || t.state === "asking" && t.openQuestion?.kind === "permission";
 // src/http.ts
 const MAX_BODY = 1048576;
 const MAX_WAIT_MS = 3e4;

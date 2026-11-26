@@ -8,7 +8,11 @@ export type Config = {
   port: number
   /** How deep below a root a repository's `.git` may sit. */
   scanDepth: number
-  worker: { model: string; permissionMode: string; maxConcurrent: number }
+  /**
+   * `maxConcurrent` caps writing Workers, `maxReadonly` readonly ones; neither
+   * pool lends the other a slot. A Worker counts while it runs a turn.
+   */
+  worker: { model: string; permissionMode: string; maxConcurrent: number; maxReadonly: number }
   router: { inlineChars: number }
   /** Seconds a Worker may sit idle in `working` before the ticket counts as stalled. */
   stallSeconds: number
@@ -40,7 +44,7 @@ export const DEFAULTS: Config = {
   roots: ['~/code'],
   port: 7707,
   scanDepth: 3,
-  worker: { model: 'opus', permissionMode: 'auto', maxConcurrent: 4 },
+  worker: { model: 'opus', permissionMode: 'auto', maxConcurrent: 20, maxReadonly: 5 },
   router: { inlineChars: 300 },
   stallSeconds: 45,
   idleExitSeconds: 0,
